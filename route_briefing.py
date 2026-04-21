@@ -15,7 +15,7 @@ Sends to: dispatcher group + driver's Telegram group
 import math
 import logging
 from database import get_all_diesel_stops, db_cursor
-from truck_stop_finder import haversine_miles, bearing, angle_diff, usable_gallons
+from truck_stop_finder import haversine_miles, bearing, angle_diff, reachable_miles
 from ifta import net_price_after_ifta, get_ifta_rate
 from border_strategy import (
     analyze_route_borders, build_border_strategy,
@@ -31,13 +31,48 @@ LATE_STOP_MILES = 120.0 # or stopping within the last 120 miles of reachable ran
 
 
 def _reachable_miles(fuel_pct: float, tank_gal: float, mpg: float) -> float:
-    """Miles truck can travel above reserve fuel."""
-    return usable_gallons(fuel_pct, tank_gal) * mpg
+    """Match the core stop finder reachability logic."""
+    return reachable_miles(fuel_pct, tank_gal, mpg)
 
 
 def _gallons_to_full(fuel_pct: float, tank_gal: float) -> float:
     """Gallons needed to fill tank from current level."""
     return round(tank_gal * (1 - fuel_pct / 100), 1)
+
+
+def _nearest_priced_stop(
+    truck_lat: float,
+    truck_lng: float,
+    all_stops: list[dict],
+    max_miles: float,
+) -> dict | None:
+    """Emergency fallback: nearest stop with a valid card price."""
+    nearest = None
+    nearest_dist = None
+    for stop in all_stops:
+        price = stop.get("diesel_price")
+        if not price:
+            continue
+        try:
+            dist = haversine_miles(
+                truck_lat, truck_lng,
+                float(stop["latitude"]), float(stop["longitude"])
+            )
+        except Exception:
+            continue
+        if dist > max_miles:
+            continue
+        if nearest is None or dist < nearest_dist:
+            nearest = {
+                **stop,
+                "dist_from_truck": round(dist, 1),
+                "card_price": round(float(price), 3),
+                "retail_price": stop.get("retail_price"),
+                "net_price": round(net_price_after_ifta(float(price), stop.get("state", "")), 4),
+                "ifta_rate": round(get_ifta_rate(stop.get("state", "")), 3),
+            }
+            nearest_dist = dist
+    return nearest
 
 
 def _can_continue_after_stop(
@@ -308,17 +343,36 @@ def plan_route_briefing(
         ]
 
         if not viable_candidates:
-            warnings.append(
-                f"No reachable fuel stop found within {range_now:.0f} miles of current range."
-            )
-            break
-
-        # At low fuel, prioritize the first safe reachable stop.
-        if (emergency_mode or critical_mode) and sim_dist == 0.0:
-            s = min(viable_candidates, key=lambda stop: stop["dist_from_truck"])
+            if (emergency_mode or critical_mode) and reachable_candidates:
+                s = min(reachable_candidates, key=lambda stop: stop["dist_from_truck"])
+            elif emergency_mode and sim_dist == 0.0:
+                s = _nearest_priced_stop(
+                    truck_lat,
+                    truck_lng,
+                    all_stops,
+                    max(range_now, 60.0),
+                )
+                if s:
+                    warnings.append(
+                        "Emergency fallback used: nearest priced stop selected because no full route candidate was available."
+                    )
+                else:
+                    warnings.append(
+                        f"No reachable fuel stop found within {range_now:.0f} miles of current range."
+                    )
+                    break
+            else:
+                warnings.append(
+                    f"No reachable fuel stop found within {range_now:.0f} miles of current range."
+                )
+                break
         else:
-            # Pick a cheap stop late enough in the range window to avoid fueling too early.
-            s = _choose_best_route_stop(viable_candidates, sim_dist, range_now)
+            # At low fuel, prioritize the first safe reachable stop.
+            if (emergency_mode or critical_mode) and sim_dist == 0.0:
+                s = min(viable_candidates, key=lambda stop: stop["dist_from_truck"])
+            else:
+                # Pick a cheap stop late enough in the range window to avoid fueling too early.
+                s = _choose_best_route_stop(viable_candidates, sim_dist, range_now)
 
         dist_to_stop = s["dist_from_truck"]
         miles_to_stop = dist_to_stop - sim_dist
