@@ -27,6 +27,8 @@ log = logging.getLogger(__name__)
 
 CORRIDOR_MILES = 75.0   # search width either side of route line
 SAFETY_BUFFER  = 0.85   # only use 85% of calculated range (safety margin)
+LATE_STOP_RATIO = 0.60  # prefer using at least 60% of current range before fueling
+LATE_STOP_MILES = 120.0 # or stopping within the last 120 miles of reachable range
 
 
 def _reachable_miles(fuel_pct: float, tank_gal: float, mpg: float) -> float:
@@ -61,6 +63,21 @@ def _can_continue_after_stop(
         and (s["dist_from_truck"] - dist_to_stop) <= post_fill_range
     ]
     return bool(next_candidates)
+
+
+def _choose_best_route_stop(
+    viable_candidates: list[dict],
+    sim_dist: float,
+    range_now: float,
+) -> dict:
+    """Prefer cheap stops later in the reachable window, not the first cheap stop."""
+    late_floor = sim_dist + max(range_now * LATE_STOP_RATIO, range_now - LATE_STOP_MILES)
+    preferred = [
+        s for s in viable_candidates
+        if s["dist_from_truck"] >= late_floor
+    ]
+    pool = preferred or viable_candidates
+    return min(pool, key=lambda stop: (stop["net_price"], -stop["dist_from_truck"]))
 
 
 def _stops_on_segment(from_lat, from_lng, to_lat, to_lng,
@@ -286,11 +303,8 @@ def plan_route_briefing(
             )
             break
 
-        # Pick the cheapest reachable stop that still keeps the trip feasible.
-        s = min(
-            viable_candidates,
-            key=lambda stop: (stop["net_price"], -stop["dist_from_truck"])
-        )
+        # Pick a cheap stop late enough in the range window to avoid fueling too early.
+        s = _choose_best_route_stop(viable_candidates, sim_dist, range_now)
 
         dist_to_stop = s["dist_from_truck"]
         miles_to_stop = dist_to_stop - sim_dist
@@ -371,7 +385,11 @@ def plan_route_briefing(
         truck_lng=truck_lng,
         truck_heading=route.get("heading", 0),
     )
-    border_warnings = format_border_warnings(border_decisions)
+    border_warn_miles = 100 if current_fuel_pct < 70 else 0
+    border_warnings = format_border_warnings(
+        border_decisions,
+        approaching_miles=border_warn_miles,
+    )
 
     # Remove any planned stops INSIDE avoid/low-stop states
     # if border strategy already handles fueling before the border
@@ -429,6 +447,8 @@ def plan_route_briefing(
         "stops_needed":              len(planned_stops),
         "planned_stops":             planned_stops,
         "border_decisions":          border_decisions,
+        "truck_lat":                 truck_lat,
+        "truck_lng":                 truck_lng,
         "total_distance":            round(total_dist, 1),
         "total_card_cost":           round(total_card, 2),
         "total_net_cost":            round(total_net, 2),
@@ -452,15 +472,22 @@ def format_route_briefing(plan: dict, truck_name: str,
     d_city = f"{dest.get('city','?')}, {dest.get('state','')}"
 
     lines = [
-        f"🗺 *Route Fuel Plan — Truck {truck_name}*",
-        f"📋 Trip #{trip}  |  {o_city} → {d_city}",
-        f"📏 {plan['total_distance']:.0f} miles  |  ⛽ {fuel_pct:.0f}% fuel  |  ⚡ {mpg:.1f} MPG",
+        f"*Route Fuel Plan - Truck {truck_name}*",
+        f"Trip #{trip}  |  {o_city} -> {d_city}",
+        f"{plan['total_distance']:.0f} miles  |  {fuel_pct:.0f}% fuel  |  {mpg:.1f} MPG",
         "",
     ]
 
+    truck_lat = plan.get("truck_lat")
+    truck_lng = plan.get("truck_lng")
+    if truck_lat is not None and truck_lng is not None:
+        lines.append(f"Current location: {truck_lat:.4f}, {truck_lng:.4f}")
+        lines.append(f"https://maps.google.com/?q={truck_lat},{truck_lng}")
+        lines.append("")
+
     if plan["can_complete_without_stop"]:
         lines += [
-            "✅ *Truck has enough fuel for the full route.*",
+            "*Truck has enough fuel for the full route.*",
             "No fuel stops needed.",
         ]
         return "\n".join(lines)

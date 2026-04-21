@@ -437,9 +437,19 @@ def find_best_stops(
     if not filtered:
         filtered = candidates  # fallback: keep all if filter removes everything
 
-    # Re-sort filtered by score
+    # Re-sort filtered by score. For advisory/warning fuel levels, avoid
+    # recommending the very first nearby stop just because it is slightly cheaper.
     filtered.sort(key=lambda s: s["_score"])
-    best = filtered[0]
+    if price_matters:
+        late_distance_floor = max(30.0, min(max_recommend_dist * 0.5, max_range * 0.6))
+        late_candidates = [
+            s for s in filtered
+            if s.get("_ahead", True) and s["distance_miles"] >= late_distance_floor
+        ]
+        best_pool = late_candidates or filtered
+        best = min(best_pool, key=lambda s: (s["_score"], -s["distance_miles"]))
+    else:
+        best = filtered[0]
 
     # Alt = most expensive stop within range (for maximum savings comparison)
     # This shows driver how much they save vs the worst option nearby

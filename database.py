@@ -496,6 +496,7 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
 
     records = []
     skipped = 0
+    duplicates = 0
     for r in rows:
         try:
             lat = _to_float(_pick(r, required_groups["latitude"]))
@@ -522,11 +523,21 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
             skipped += 1
 
     if not records:
-        return 0, "❌ No valid records found in file."
+        return 0, "No valid records found in file."
+
+    deduped = {}
+    for record in records:
+        key = (
+            str(record.get("station_name", "")).strip().upper(),
+            str(record.get("city", "")).strip().upper(),
+            str(record.get("state", "")).strip().upper(),
+        )
+        if key in deduped:
+            duplicates += 1
+        deduped[key] = record
+    records = list(deduped.values())
 
     with db_cursor() as cur:
-        # Upsert — update existing prices, insert new ones
-        # NEVER delete — price history stays forever
         cur.execute("TRUNCATE TABLE fuel_stops RESTART IDENTITY")
         cur.executemany("""
             INSERT INTO fuel_stops
@@ -539,10 +550,11 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
         """, records)
 
     msg = (
-        f"✅ *Fuel prices updated*\n"
-        f"⛽ {len(records)} stations loaded\n"
-        f"⏭ {skipped} skipped (missing data)\n"
-        f"🔄 Using discounted (card) price for routing"
+        f"Fuel prices updated\n"
+        f"{len(records)} stations loaded\n"
+        f"{skipped} skipped (missing data)\n"
+        f"{duplicates} duplicate rows merged\n"
+        f"Using discounted (card) price for routing"
     )
     return len(records), msg
 

@@ -516,8 +516,9 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 # Only warn if truck doesn't have enough fuel to cross the state
                 range_miles  = (fuel / 100) * tank_gal * mpg * 0.85
                 needs_fuel   = range_miles < (dist + event.exit_dist)
-                # Fire when within 150 miles AND actually needs fuel
-                if 0 < dist <= 150 and needs_fuel and not state.get(key):
+                # Fire only when the truck is actually close to the border
+                # and still under the desired entry fuel threshold.
+                if 0 < dist <= 100 and fuel < 70 and needs_fuel and not state.get(key):
                     all_stops = get_all_diesel_stops()
                     for s in all_stops:
                         s["dist_from_truck"] = haversine_miles(
@@ -535,7 +536,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                         truck_lng=lng,
                         truck_heading=heading,
                     )
-                    lines = format_border_warnings(decisions)
+                    lines = format_border_warnings(decisions, approaching_miles=100)
 
                     if lines:
                         from telegram_bot import _send_to, _send_to_dispatcher

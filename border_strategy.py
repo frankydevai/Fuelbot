@@ -346,6 +346,8 @@ def format_border_warnings(decisions: list[dict],
     lines = []
     for d in decisions:
         event = d["event"]
+        if event.dist_to_entry > approaching_miles:
+            continue
 
         if d["action"] == "coast":
             lines.append(
