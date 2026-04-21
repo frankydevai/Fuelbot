@@ -341,6 +341,7 @@ def register_commands():
         {"command": "findstop",    "description": "Find cheapest stops — /findstop 0792"},
         {"command": "route",       "description": "Show active load — /route 0792"},
         {"command": "findload",    "description": "Search QM trip — /findload 8656"},
+        {"command": "qmload",      "description": "Read QM load by truck - /qmload 0792"},
         {"command": "resetpilot",  "description": "Wipe Pilot DB rows"},
         {"command": "dbstats",     "description": "Show DB stats"},
         {"command": "addtruck",    "description": "Add truck — /addtruck 4821 -100123456"},
@@ -466,6 +467,8 @@ def poll_for_uploads():
                 _handle_loadroute(text, chat_id)
             elif text.startswith("/route"):
                 _handle_route(text, chat_id)
+            elif text.startswith("/qmload"):
+                _handle_qmload(text, chat_id)
             elif text.startswith("/newalert"):
                 _handle_newalert(text)
             elif text.startswith("/flags"):
@@ -508,9 +511,10 @@ def poll_for_uploads():
                             "/addtruck Unit4821 -100123456\n"
                             "/setgroup Unit4821 -100123456\n"
                             "/listtruck\n/removetruck Unit4821\n"
-                            "/findstop 0792  ← any group\n"
-                            "/route 0792  ← any group\n"
-                            "/findload 8656  ← search QM trip"
+                            "/findstop 0792  ? any group\n"
+                            "/route 0792  ? any group\n"
+                            "/qmload 0792  ? read QM load by truck\n"
+                            "/findload 8656  ? search QM trip"
                         )
                 except Exception as e:
                     log.error(f"Command error: {e}", exc_info=True)
@@ -888,12 +892,17 @@ def _handle_route(text: str, chat_id: str) -> None:
         is_next = (city == dest.get("city") and state == dest.get("state"))
         arrow   = "  ← *NEXT*" if is_next else ""
         lines  += [f"{icon} *Stop {stop_n} — {stype}*{arrow}", f"   {company}", f"   📍 {loc}"]
-        appt = s.get("appt") or s.get("appointment_date","")
         if appt:
             lines.append(f"   🕐 {str(appt)[:16].replace('T',' ')}")
         lines.append("")
     lines.append(f"🏁 *Destination: {dest.get('city')}, {dest.get('state')}*")
     _send_to(chat_id, "\n".join(lines))
+
+
+def _handle_qmload(text: str, chat_id: str) -> None:
+    """/qmload <truck> - alias for active QuickManage load details by truck number."""
+    _handle_route(text.replace("/qmload", "/route", 1), chat_id)
+
 
 
 def _handle_loadroute(text: str, chat_id: str) -> None:
