@@ -28,6 +28,8 @@ log = logging.getLogger(__name__)
 CORRIDOR_MILES = 75.0   # search width either side of route line
 LATE_STOP_RATIO = 0.60  # prefer using at least 60% of current range before fueling
 LATE_STOP_MILES = 120.0 # or stopping within the last 120 miles of reachable range
+EARLY_STOP_MIN_MILES = 75.0
+EARLY_STOP_MIN_RANGE_RATIO = 0.25
 
 
 def _reachable_miles(fuel_pct: float, tank_gal: float, mpg: float) -> float:
@@ -102,8 +104,18 @@ def _choose_best_route_stop(
     viable_candidates: list[dict],
     sim_dist: float,
     range_now: float,
+    current_fuel_pct: float,
 ) -> dict:
     """Prefer cheap stops later in the reachable window, not the first cheap stop."""
+    healthy_floor = sim_dist + max(EARLY_STOP_MIN_MILES, range_now * EARLY_STOP_MIN_RANGE_RATIO)
+    if current_fuel_pct >= 35:
+        not_too_early = [
+            s for s in viable_candidates
+            if s["dist_from_truck"] >= healthy_floor
+        ]
+        if not_too_early:
+            viable_candidates = not_too_early
+
     late_floor = sim_dist + max(range_now * LATE_STOP_RATIO, range_now - LATE_STOP_MILES)
     preferred = [
         s for s in viable_candidates
@@ -372,7 +384,7 @@ def plan_route_briefing(
                 s = min(viable_candidates, key=lambda stop: stop["dist_from_truck"])
             else:
                 # Pick a cheap stop late enough in the range window to avoid fueling too early.
-                s = _choose_best_route_stop(viable_candidates, sim_dist, range_now)
+                s = _choose_best_route_stop(viable_candidates, sim_dist, range_now, sim_fuel)
 
         dist_to_stop = s["dist_from_truck"]
         miles_to_stop = dist_to_stop - sim_dist
