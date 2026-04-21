@@ -15,26 +15,24 @@ Sends to: dispatcher group + driver's Telegram group
 import math
 import logging
 from database import get_all_diesel_stops, db_cursor
-from truck_stop_finder import haversine_miles, bearing, angle_diff
+from truck_stop_finder import haversine_miles, bearing, angle_diff, usable_gallons
 from ifta import net_price_after_ifta, get_ifta_rate
 from border_strategy import (
     analyze_route_borders, build_border_strategy,
     format_border_warnings, AVOID_FUEL_STATES, LOW_STOP_STATES
 )
-from config import DEFAULT_TANK_GAL, DEFAULT_MPG
+from config import DEFAULT_TANK_GAL, DEFAULT_MPG, IFTA_HOME_STATE
 
 log = logging.getLogger(__name__)
 
 CORRIDOR_MILES = 75.0   # search width either side of route line
-SAFETY_BUFFER  = 0.85   # only use 85% of calculated range (safety margin)
 LATE_STOP_RATIO = 0.60  # prefer using at least 60% of current range before fueling
 LATE_STOP_MILES = 120.0 # or stopping within the last 120 miles of reachable range
 
 
 def _reachable_miles(fuel_pct: float, tank_gal: float, mpg: float) -> float:
-    """Miles truck can travel on current fuel with safety buffer."""
-    gallons = tank_gal * (fuel_pct / 100)
-    return gallons * mpg * SAFETY_BUFFER
+    """Miles truck can travel above reserve fuel."""
+    return usable_gallons(fuel_pct, tank_gal) * mpg
 
 
 def _gallons_to_full(fuel_pct: float, tank_gal: float) -> float:
@@ -245,11 +243,16 @@ def plan_route_briefing(
     cur_fuel_pct   = current_fuel_pct
     stop_number = 1
     emergency_mode = current_fuel_pct <= 10
-    FILL_TO     = 100.0 if emergency_mode else 90.0
+    critical_mode  = current_fuel_pct <= 20
+    FILL_TO        = 100.0 if emergency_mode else 90.0
 
     if emergency_mode:
         warnings.append(
             f"Emergency fuel level: {current_fuel_pct:.0f}% fuel. Nearest reachable stop takes priority."
+        )
+    elif critical_mode:
+        warnings.append(
+            f"Critical fuel level: {current_fuel_pct:.0f}% fuel. First safe stop takes priority over later cheaper stops."
         )
 
     # ── Collect all stops along route ────────────────────────────────────────
@@ -310,8 +313,8 @@ def plan_route_briefing(
             )
             break
 
-        # At emergency fuel levels, prioritize the nearest reachable stop.
-        if emergency_mode and sim_dist == 0.0:
+        # At low fuel, prioritize the first safe reachable stop.
+        if (emergency_mode or critical_mode) and sim_dist == 0.0:
             s = min(viable_candidates, key=lambda stop: stop["dist_from_truck"])
         else:
             # Pick a cheap stop late enough in the range window to avoid fueling too early.
@@ -467,6 +470,9 @@ def plan_route_briefing(
         "border_warnings":           border_warnings, # sent separately
         "can_complete_without_stop": False,
         "emergency_mode":            emergency_mode,
+        "critical_mode":             critical_mode,
+        "ifta_enabled":              bool(IFTA_HOME_STATE),
+        "ifta_home_state":           IFTA_HOME_STATE,
     }
 
 
@@ -500,6 +506,9 @@ def format_route_briefing(plan: dict, truck_name: str,
     if plan.get("emergency_mode"):
         lines.append("EMERGENCY: fuel is critically low. Route pricing is secondary to reaching fuel safely.")
         lines.append("")
+    elif plan.get("critical_mode"):
+        lines.append("CRITICAL: fuel is low. The first safe stop is prioritized before later cheaper options.")
+        lines.append("")
 
     if plan["can_complete_without_stop"]:
         lines += [
@@ -529,12 +538,24 @@ def format_route_briefing(plan: dict, truck_name: str,
         if s.get("retail_price"):
             lines.append(f"💰 Retail: ${s['retail_price']:.3f}/gal")
         lines.append(f"💳 Card:   *${s['card_price']:.3f}/gal*")
-
-        lines.append(
-            f"💵 Fill *{s['gallons_to_fill']:.0f} gal* → "
-            f"Pump: ${s['total_card_cost']:.0f} · "
-            f"Net after IFTA: *${s['total_net_cost']:.0f}*"
-        )
+        if plan.get("ifta_enabled"):
+            if abs(s["total_net_cost"] - s["total_card_cost"]) >= 1:
+                lines.append(
+                    f"💵 Fill *{s['gallons_to_fill']:.0f} gal* → "
+                    f"Pump: ${s['total_card_cost']:.0f} · "
+                    f"Net after IFTA: *${s['total_net_cost']:.0f}*"
+                )
+            else:
+                lines.append(
+                    f"💵 Fill *{s['gallons_to_fill']:.0f} gal* → "
+                    f"Estimated total: *${s['total_card_cost']:.0f}*"
+                )
+        else:
+            lines.append(
+                f"💵 Fill *{s['gallons_to_fill']:.0f} gal* → "
+                f"Card total: *${s['total_card_cost']:.0f}*"
+            )
+            lines.append("📋 IFTA adjustment is off because `IFTA_HOME_STATE` is not set.")
 
         if s.get("maps_url"):
             lines.append(f"🗺 [Open in Google Maps]({s['maps_url']})")
@@ -588,10 +609,13 @@ def format_next_stop(stop: dict, stop_num: int, total_stops: int,
     if card:
         lines.append(f"💳 Card:   *${card:.3f}/gal*")
     if pump_cost:
-        if abs(net_cost - pump_cost) > 1:
+        if IFTA_HOME_STATE and abs(net_cost - pump_cost) > 1:
             lines.append(f"💵 Fill ~{gallons:.0f} gal → Pump: ${pump_cost:.0f} · Net after IFTA: *${net_cost:.0f}*")
+        elif IFTA_HOME_STATE:
+            lines.append(f"💵 Fill ~{gallons:.0f} gal → Estimated total: ${pump_cost:.0f}")
         else:
-            lines.append(f"💵 Fill ~{gallons:.0f} gal = ${pump_cost:.0f}")
+            lines.append(f"💵 Fill ~{gallons:.0f} gal → Card total: ${pump_cost:.0f}")
+            lines.append("📋 IFTA adjustment is off because `IFTA_HOME_STATE` is not set.")
     if lat and lng:
         lines.append(f"🗺 [Open in Google Maps](https://maps.google.com/?q={lat},{lng})")
 

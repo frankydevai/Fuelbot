@@ -490,7 +490,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 analyze_route_borders, build_border_strategy,
                 format_border_warnings, AVOID_FUEL_STATES, LOW_STOP_STATES
             )
-            from truck_stop_finder import haversine_miles
+            from truck_stop_finder import haversine_miles, reachable_miles
             from database import get_all_diesel_stops
 
             waypoints = []
@@ -514,7 +514,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 dist = event.dist_to_entry
 
                 # Only warn if truck doesn't have enough fuel to cross the state
-                range_miles  = (fuel / 100) * tank_gal * mpg * 0.85
+                range_miles  = reachable_miles(fuel, tank_gal, mpg)
                 needs_fuel   = range_miles < (dist + event.exit_dist)
                 # Fire only when the truck is actually close to the border
                 # and still under the desired entry fuel threshold.
