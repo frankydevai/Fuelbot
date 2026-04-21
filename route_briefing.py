@@ -145,19 +145,32 @@ def plan_route_briefing(
     stops_raw = route.get("stops", [])
     dest      = route.get("destination", {})
 
-    # Build waypoints: current pos → all route stops with coords → destination
+    # Build waypoints: current pos → AHEAD-only route stops → destination
+    # Filter out delivery stops already behind the truck — they inflate seg_base
+    # and make every fuel stop appear unreachable.
+    dest_lat = float(dest["lat"]) if dest.get("lat") else None
+    dest_lng = float(dest["lng"]) if dest.get("lng") else None
+    dest_brg = bearing(truck_lat, truck_lng, dest_lat, dest_lng) if (dest_lat and dest_lng) else None
+
     waypoints = [{"lat": truck_lat, "lng": truck_lng}]
     for s in stops_raw:
         if s.get("lat") and s.get("lng"):
-            wp_dist = haversine_miles(truck_lat, truck_lng,
-                                      float(s["lat"]), float(s["lng"]))
-            if wp_dist > 1.0:
-                waypoints.append({
-                    "lat":   float(s["lat"]),
-                    "lng":   float(s["lng"]),
-                    "city":  s.get("city", ""),
-                    "state": s.get("state", ""),
-                })
+            wp_lat = float(s["lat"])
+            wp_lng = float(s["lng"])
+            if haversine_miles(truck_lat, truck_lng, wp_lat, wp_lng) <= 1.0:
+                continue  # same location
+            # Skip stops behind the truck (already delivered)
+            if dest_brg is not None:
+                wp_brg = bearing(truck_lat, truck_lng, wp_lat, wp_lng)
+                if angle_diff(dest_brg, wp_brg) > 90:
+                    log.debug(f"  Waypoint {s.get('city','?')} behind truck — skipping")
+                    continue
+            waypoints.append({
+                "lat":   wp_lat,
+                "lng":   wp_lng,
+                "city":  s.get("city", ""),
+                "state": s.get("state", ""),
+            })
 
     if dest.get("lat") and dest.get("lng"):
         waypoints.append({
@@ -176,6 +189,40 @@ def plan_route_briefing(
                         waypoints[i+1]["lat"], waypoints[i+1]["lng"])
         for i in range(len(waypoints) - 1)
     )
+
+    # ── ROUTE SANITY CHECKS ──────────────────────────────────────────────────
+    # Skip briefings for short hops — yard moves, local deliveries don't need
+    # fuel planning. Tank handles them.
+    MIN_BRIEFING_MILES = 50
+    if total_dist < MIN_BRIEFING_MILES:
+        log.info(f"Route briefing skipped: only {total_dist:.0f}mi (< {MIN_BRIEFING_MILES}mi threshold)")
+        return {
+            "stops_needed":               0,
+            "planned_stops":              [],
+            "total_distance":             round(total_dist, 1),
+            "total_card_cost":            0,
+            "total_net_cost":             0,
+            "warnings":                   [],
+            "can_complete_without_stop":  True,
+            "skipped_short_route":        True,
+        }
+
+    # Detect impossibly long single hops between consecutive waypoints.
+    # Continental US is ~2800mi end-to-end; any single waypoint-to-waypoint
+    # leg over 1500mi means the geocoding is wrong (e.g. address resolved
+    # to the wrong "Springfield"). Abort to avoid sending bogus warnings.
+    MAX_LEG_MILES = 1500
+    for i in range(len(waypoints) - 1):
+        leg = haversine_miles(waypoints[i]["lat"], waypoints[i]["lng"],
+                              waypoints[i+1]["lat"], waypoints[i+1]["lng"])
+        if leg > MAX_LEG_MILES:
+            wa = waypoints[i].get("state", "?") or "?"
+            wb = waypoints[i+1].get("state", "?") or "?"
+            log.error(
+                f"Route briefing aborted: leg {i}→{i+1} is {leg:.0f}mi "
+                f"({wa}→{wb}) — likely bad geocoding."
+            )
+            return {"error": f"Route waypoints span {leg:.0f}mi between {wa} and {wb} — likely geocoding error. Briefing aborted."}
 
     # Can truck complete without stopping?
     range_miles = _reachable_miles(current_fuel_pct, tank_gal, mpg)
@@ -239,23 +286,50 @@ def plan_route_briefing(
     sim_fuel = current_fuel_pct
     sim_dist = 0.0
 
-    for s in unique_candidates:
+    idx = 0
+    while idx < len(unique_candidates):
+        s = unique_candidates[idx]
         dist_to_stop  = s["dist_from_truck"]
         miles_to_stop = dist_to_stop - sim_dist
 
         if miles_to_stop <= 0:
+            idx += 1
             continue  # already past this stop in simulation
 
         # Can truck reach this stop on current simulated fuel?
         range_now = _reachable_miles(sim_fuel, tank_gal, mpg)
         if range_now < miles_to_stop:
-            # Can't reach this stop — truck would run out before it
-            # This means we missed a stop earlier — warn and continue
-            warnings.append(
-                f"⚠️ Cannot reach {s['store_name']} ({s['city']}, {s['state']}) "
-                f"— {miles_to_stop:.0f}mi needed but only {range_now:.0f}mi range"
-            )
-            continue
+            # Can't reach this stop — back up and try an earlier one we skipped
+            # Look for the furthest earlier candidate that IS reachable from sim_dist
+            fallback = None
+            for j in range(idx - 1, -1, -1):
+                cand = unique_candidates[j]
+                cand_miles = cand["dist_from_truck"] - sim_dist
+                if cand_miles <= 0:
+                    break  # passed it already
+                if cand.get("store_name") in used_names:
+                    continue
+                if range_now >= cand_miles:
+                    fallback = cand
+                    break
+            if fallback is not None:
+                # Use the fallback as the stop we MUST hit
+                s = fallback
+                dist_to_stop  = s["dist_from_truck"]
+                miles_to_stop = dist_to_stop - sim_dist
+                # Rewind idx so the forward walk resumes from fallback's position
+                idx = unique_candidates.index(fallback)
+            else:
+                # Genuinely no reachable stop ahead → log only, do NOT spam dispatcher.
+                # The user-facing message is implicit: only the stops we could plan
+                # are shown. Dispatcher sees the planned stops and can route accordingly.
+                log.warning(
+                    f"  Planner: no reachable stop ahead from sim_dist={sim_dist:.0f}mi "
+                    f"sim_fuel={sim_fuel:.0f}% — next candidate {s['store_name']} "
+                    f"({s['city']},{s['state']}) is {miles_to_stop:.0f}mi but only "
+                    f"{range_now:.0f}mi range. Stopping plan here."
+                )
+                break
 
         # Can truck skip this stop and still reach the NEXT waypoint?
         next_stops = [x for x in unique_candidates if x["dist_from_truck"] > dist_to_stop + 5]
@@ -272,6 +346,7 @@ def plan_route_briefing(
         can_skip = range_from_here >= (miles_to_next - miles_to_stop + 20)  # 20mi safety
 
         if can_skip:
+            idx += 1
             continue  # truck has enough fuel to skip this stop
 
         # Stop here — truck needs fuel
@@ -316,6 +391,8 @@ def plan_route_briefing(
         # Done if truck can reach destination from here
         if _reachable_miles(sim_fuel, tank_gal, mpg) >= (total_dist - sim_dist):
             break
+
+        idx += 1
 
         # ── Border strategy analysis ──────────────────────────────────────────
     # Build waypoints with CUMULATIVE along-route distance (not straight-line)
@@ -370,10 +447,25 @@ def plan_route_briefing(
     for d in border_decisions:
         if d["action"] == "fuel_before_border" and d["stop"]:
             s = d["stop"]
+            # Skip pre-border stops the truck cannot physically reach
+            if d.get("needs_earlier_stop"):
+                log.warning(
+                    f"  Border planner: pre-border stop {s.get('store_name','?')} "
+                    f"({s.get('state','?')}) is out of range — skipping (driver "
+                    f"will fuel at an earlier stop from the regular plan)."
+                )
+                continue
             # Calculate fuel at arrival to the pre-border stop
             dist_to_stop    = s.get("dist_from_truck", 0)
             fuel_consumed   = (dist_to_stop / mpg / tank_gal) * 100
-            fuel_at_arrival = max(current_fuel_pct - fuel_consumed, 5)
+            fuel_at_arrival = current_fuel_pct - fuel_consumed
+            # If truck arrives below 5%, this stop is not safe — skip silently
+            if fuel_at_arrival < 5:
+                log.warning(
+                    f"  Border planner: would arrive at {s.get('store_name','?')} "
+                    f"with {fuel_at_arrival:.0f}% fuel — unsafe, skipping."
+                )
+                continue
             # Fill from fuel_at_arrival up to fill_to_pct
             gal = round(tank_gal * max(d["fill_to_pct"] - fuel_at_arrival, 0) / 100, 1)
             border_stops.append({
@@ -425,9 +517,18 @@ def plan_route_briefing(
 
 def format_route_briefing(plan: dict, truck_name: str,
                            route: dict, fuel_pct: float, mpg: float) -> str:
-    """Format the route briefing as a clean Telegram message."""
+    """Format the route briefing as a clean Telegram message.
+
+    Returns empty string if there's nothing to send (short hops, errors).
+    Caller MUST check for empty before sending.
+    """
+    # Skip silently for sub-50mi routes — yard moves don't need briefings
+    if plan.get("skipped_short_route"):
+        return ""
+    # Skip silently for geocoding-error routes — better to send nothing than wrong info
     if "error" in plan:
-        return f"❌ Route plan error: {plan['error']}"
+        log.warning(f"Route briefing not sent for {truck_name}: {plan['error']}")
+        return ""
 
     origin = route.get("origin", {})
     dest   = route.get("destination", {})

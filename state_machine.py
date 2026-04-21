@@ -48,6 +48,7 @@ from california import (
 from telegram_bot import (
     send_low_fuel_alert,
     send_at_stop_alert,
+    send_emergency_alert,
     delete_message,
     send_ca_border_reminder,
     send_refueled_alert,
@@ -265,59 +266,76 @@ def process_truck(vid, prev_state, current_data, truck_states):
             )
             msg = format_route_briefing(plan, vname, route, fuel, mpg)
 
-            # Send to driver group + dispatcher
-            # Delete previous route briefing first (only briefings, not flags/emergencies)
-            truck_group = get_truck_group(vname)
-            prev_briefing_truck      = state.get("prev_briefing_truck_msg_id")
-            prev_briefing_dispatcher = state.get("prev_briefing_dispatcher_msg_id")
-
-            if truck_group and prev_briefing_truck:
-                delete_message(truck_group, prev_briefing_truck)
-            if prev_briefing_dispatcher:
-                delete_message(str(DISPATCHER_GROUP_ID), prev_briefing_dispatcher)
-
-            truck_msg_id      = _send_to(truck_group, msg) if truck_group else None
-            dispatcher_msg_id = _send_to_dispatcher(msg)
-
-            # Store message IDs so next briefing can delete these
-            state["prev_briefing_truck_msg_id"]      = truck_msg_id
-            state["prev_briefing_dispatcher_msg_id"] = dispatcher_msg_id
-
-            # Send border warnings as separate alert if any
-            border_warnings = plan.get("border_warnings", [])
-            if border_warnings:
-                NL       = chr(10)
-                bw_title = f"⚠️ *State Border Alert — Truck {vname}*"
-                bw_msg   = bw_title + NL + NL.join(border_warnings)
-                if truck_group:
-                    _send_to(truck_group, bw_msg)
-                _send_to_dispatcher(bw_msg)
-
-            # Mark as sent so we don't resend — persist immediately
-            state["briefing_sent_trip"] = route_id
-            try:
-                from database import save_trip_state
-                save_trip_state(vname, state)
-                log.info(f"  {vname}: trip state persisted — trip {route_id}")
-            except Exception as dbe:
-                log.warning(f"  {vname}: trip state save failed: {dbe}")
-
-            # Store planned stops so missed-stop detection works
-            if plan.get("planned_stops"):
-                next_stop = plan["planned_stops"][0]
-                state["assigned_stop_name"]       = next_stop["store_name"]
-                state["assigned_stop_lat"]        = next_stop.get("latitude") or next_stop.get("lat")
-                state["assigned_stop_lng"]        = next_stop.get("longitude") or next_stop.get("lng")
-                state["assigned_stop_dist"]       = next_stop.get("dist_from_truck", 0)
-                state["assigned_stop_card_price"] = next_stop.get("card_price") or next_stop.get("diesel_price")
-                state["all_planned_stops"]        = plan["planned_stops"]
-                state["planned_stop_index"]       = 0
-                log.info(f"  {vname}: route briefing sent — trip {route_id}, "
-                         f"{plan['stops_needed']} stops planned, "
-                         f"first stop: {next_stop['store_name']}")
+            # Skip silently if nothing to send (short route or geocoding error).
+            # Still mark briefing_sent_trip so we don't keep retrying every cycle.
+            if not msg:
+                state["briefing_sent_trip"] = route_id
+                try:
+                    from database import save_trip_state
+                    save_trip_state(vname, state)
+                except Exception:
+                    pass
+                log.info(f"  {vname}: route briefing skipped (short route or bad route data)")
+                # Fall through past this whole block by jumping to the end
+                state["last_trip_status"] = curr_status
+                # Don't return — let other state-machine logic still run
+                # (border checks, fuel alerts, etc.)
             else:
-                log.info(f"  {vname}: route briefing sent — trip {route_id}, "
-                         f"no stops needed")
+                # Send to driver group + dispatcher
+                # Delete previous route briefing first (only briefings, not flags/emergencies)
+                truck_group = get_truck_group(vname)
+                prev_briefing_truck      = state.get("prev_briefing_truck_msg_id")
+                prev_briefing_dispatcher = state.get("prev_briefing_dispatcher_msg_id")
+
+                if truck_group and prev_briefing_truck:
+                    delete_message(truck_group, prev_briefing_truck)
+                if prev_briefing_dispatcher:
+                    delete_message(str(DISPATCHER_GROUP_ID), prev_briefing_dispatcher)
+
+                if not truck_group:
+                    log.warning(f"  {vname}: NO Telegram group — route briefing NOT sent to driver. Fix: /setgroup {vname} <GROUP_ID>")
+                truck_msg_id      = _send_to(truck_group, msg) if truck_group else None
+                dispatcher_msg_id = _send_to_dispatcher(msg)
+
+                # Store message IDs so next briefing can delete these
+                state["prev_briefing_truck_msg_id"]      = truck_msg_id
+                state["prev_briefing_dispatcher_msg_id"] = dispatcher_msg_id
+
+                # Send border warnings as separate alert if any
+                border_warnings = plan.get("border_warnings", [])
+                if border_warnings:
+                    NL       = chr(10)
+                    bw_title = f"⚠️ *State Border Alert — Truck {vname}*"
+                    bw_msg   = bw_title + NL + NL.join(border_warnings)
+                    if truck_group:
+                        _send_to(truck_group, bw_msg)
+                    _send_to_dispatcher(bw_msg)
+
+                # Mark as sent so we don't resend — persist immediately
+                state["briefing_sent_trip"] = route_id
+                try:
+                    from database import save_trip_state
+                    save_trip_state(vname, state)
+                    log.info(f"  {vname}: trip state persisted — trip {route_id}")
+                except Exception as dbe:
+                    log.warning(f"  {vname}: trip state save failed: {dbe}")
+
+                # Store planned stops so missed-stop detection works
+                if plan.get("planned_stops"):
+                    next_stop = plan["planned_stops"][0]
+                    state["assigned_stop_name"]       = next_stop["store_name"]
+                    state["assigned_stop_lat"]        = next_stop.get("latitude") or next_stop.get("lat")
+                    state["assigned_stop_lng"]        = next_stop.get("longitude") or next_stop.get("lng")
+                    state["assigned_stop_dist"]       = next_stop.get("dist_from_truck", 0)
+                    state["assigned_stop_card_price"] = next_stop.get("card_price") or next_stop.get("diesel_price")
+                    state["all_planned_stops"]        = plan["planned_stops"]
+                    state["planned_stop_index"]       = 0
+                    log.info(f"  {vname}: route briefing sent — trip {route_id}, "
+                             f"{plan['stops_needed']} stops planned, "
+                             f"first stop: {next_stop['store_name']}")
+                else:
+                    log.info(f"  {vname}: route briefing sent — trip {route_id}, "
+                             f"no stops needed")
         except Exception as e:
             log.error(f"  {vname}: route briefing failed: {e}", exc_info=True)
 
@@ -631,7 +649,6 @@ def process_truck(vid, prev_state, current_data, truck_states):
         rec_name  = state.get("assigned_stop_name")
 
         try:
-            from truck_stop_finder import find_current_stop
             actual_stop = find_current_stop(lat, lng)
 
             # If not found at current GPS — check location history
@@ -942,6 +959,8 @@ def process_truck(vid, prev_state, current_data, truck_states):
                         truck_group = get_truck_group(vname)
                         if truck_group:
                             _send_to(truck_group, msg)
+                        else:
+                            log.warning(f"  {vname}: NO Telegram group — next stop NOT sent to driver")
                         _send_to_dispatcher(msg)
                         log.info(f"  {vname}: next stop sent — {next_stop['store_name']}")
                     except Exception as nse:
@@ -1083,12 +1102,48 @@ def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
     current_stop = find_current_stop(lat, lng) if speed < 3 else None
     if current_stop:
         log.info(f"  {vname}: at stop {current_stop['store_name']} — at-stop alert")
-        result = send_at_stop_alert(vname, fuel, lat, lng, current_stop)
+        # Compare against recommended stop
+        assigned_name  = state.get("assigned_stop_name")
+        assigned_price = state.get("assigned_stop_card_price")
+        result = send_at_stop_alert(
+            vname, fuel, lat, lng, current_stop,
+            assigned_stop_name=assigned_name,
+            assigned_stop_card_price=assigned_price,
+        )
         if isinstance(result, dict):
             state["prev_truck_group"]       = result.get("truck_group")
             state["prev_truck_msg_id"]      = result.get("truck_msg_id")
             state["prev_dispatcher_msg_id"] = result.get("dispatcher_msg_id")
         state["alert_sent"] = True
+
+        # If parked at a DIFFERENT stop than recommended → flag it
+        # (only fire once per assignment to avoid spam — track via state)
+        if assigned_name:
+            cur_name = (current_stop.get("store_name") or "").strip().upper()
+            asg_name = assigned_name.strip().upper()
+            is_match = (asg_name == cur_name) or (asg_name in cur_name) or (cur_name in asg_name)
+            already_flagged = state.get("wrong_stop_flagged_for") == assigned_name
+            if not is_match and not already_flagged:
+                try:
+                    from flag_system import flag_wrong_stop
+                    from database import get_truck_group
+                    truck_group = get_truck_group(vname)
+                    flag_wrong_stop(
+                        vehicle_name=vname,
+                        truck_group_id=truck_group,
+                        recommended=assigned_name,
+                        actual=current_stop.get("store_name", "Unknown"),
+                        fuel_before=fuel,
+                        fuel_after=fuel,  # we don't know post-fill yet at this point
+                        recommended_card_price=assigned_price,
+                        actual_card_price=current_stop.get("diesel_price"),
+                        tank_gal=tank_gal,
+                    )
+                    state["wrong_stop_flagged_for"] = assigned_name
+                    log.warning(f"  {vname}: parked at WRONG stop "
+                                f"({current_stop['store_name']} vs {assigned_name})")
+                except Exception as fe:
+                    log.warning(f"  {vname}: at-stop wrong-stop flag failed: {fe}")
         return
 
     # ── Case 2: Check if truck can reach planned stop ─────────────────────────

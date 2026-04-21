@@ -111,7 +111,6 @@ def main():
     last_route_fetch    = _utcnow() - timedelta(minutes=10)  # fetch immediately on start
     last_mpg_sync       = _utcnow() - timedelta(hours=2)     # sync MPG immediately on start
     last_ifta_check     = _utcnow() - timedelta(hours=25)    # check IFTA rates immediately on start
-    last_ifta_update    = _utcnow() - timedelta(days=91)     # update IFTA rates immediately
     poll_cycle          = 0
 
     # Start background thread for QM route geocoding (slow — don't block alerts)
@@ -183,6 +182,7 @@ def main():
         try:
             poll_cycle += 1
             now = _utcnow()
+            log.info(f"=== Poll cycle #{poll_cycle} start @ {now.isoformat()} ===")
 
             # -- Background route fetch (every 5 min) ------------------------
             if (now - last_route_fetch).total_seconds() >= 300:
@@ -190,22 +190,9 @@ def main():
                 t.start()
                 last_route_fetch = now
 
-            # -- IFTA rates update (every 90 days = quarterly) ---------------
-            if (now - last_ifta_update).total_seconds() >= 7776000:
-                def _update_ifta():
-                    try:
-                        from ifta import update_ifta_rates_from_web
-                        ok = update_ifta_rates_from_web()
-                        if ok:
-                            from telegram_bot import _send_to
-                            from config import ADMIN_CHAT_ID
-                            _send_to(ADMIN_CHAT_ID, "✅ IFTA rates updated from official source.")
-                    except Exception as e:
-                        log.warning(f"IFTA update failed: {e}")
-                threading.Thread(target=_update_ifta, daemon=True).start()
-                last_ifta_update = now
-
             # -- IFTA rates check (every 24h — updates when new quarter starts) --
+            # Consolidated: _update_ifta_background handles both the quarterly
+            # check and the actual scrape via scrape_and_update_ifta_rates().
             if (now - last_ifta_check).total_seconds() >= 86400:
                 t = threading.Thread(target=_update_ifta_background, daemon=True)
                 t.start()
@@ -285,7 +272,22 @@ def main():
                      f"{len(due_trucks)} due for check")
 
             # -- Process due trucks -------------------------------------------
+            # Budget: 5 minutes total per poll cycle for ALL trucks. If exceeded,
+            # we skip remaining trucks for this cycle — they'll be processed
+            # next cycle. Keeps the poll loop responsive during Telegram/API issues.
+            POLL_BUDGET_SECONDS = 300
+            cycle_start = time.time()
+            processed = 0
+            skipped_for_budget = 0
             for truck in due_trucks:
+                if (time.time() - cycle_start) > POLL_BUDGET_SECONDS:
+                    skipped_for_budget = len(due_trucks) - processed
+                    log.warning(
+                        f"Poll budget {POLL_BUDGET_SECONDS}s exceeded. "
+                        f"Processed {processed}/{len(due_trucks)} trucks, "
+                        f"skipping {skipped_for_budget} until next cycle."
+                    )
+                    break
                 vid = truck["vehicle_id"]
                 # Attach QuickManage route to truck state if available
                 truck_num = truck.get("vehicle_name", "")
@@ -293,6 +295,7 @@ def main():
                     truck_states.setdefault(vid, {})["qm_route"] = qm_routes[truck_num]
                 elif truck_states.get(vid, {}).get("qm_route"):
                     pass  # keep existing route
+                truck_start = time.time()
                 try:
                     process_truck(vid, truck_states.get(vid, {}),
                                   truck, truck_states)
@@ -302,6 +305,15 @@ def main():
                         save_truck_state(truck_states[vid])
                 except Exception as e:
                     log.error(f"Error processing {truck['vehicle_name']}: {e}", exc_info=True)
+                truck_elapsed = time.time() - truck_start
+                if truck_elapsed > 30:
+                    log.warning(
+                        f"⏱  Slow truck {truck.get('vehicle_name','?')}: {truck_elapsed:.0f}s "
+                        f"— investigate (likely Telegram or DB hang)"
+                    )
+                processed += 1
+            log.info(f"Poll #{poll_cycle} done: processed {processed}/{len(due_trucks)} "
+                     f"in {time.time()-cycle_start:.0f}s")
 
             # -- Periodic DB save ---------------------------------------------
             if (now - last_db_save).total_seconds() >= STATE_SAVE_INTERVAL_SECONDS:

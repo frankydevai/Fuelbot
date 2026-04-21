@@ -35,6 +35,9 @@ def get_connection(retries: int = 3, delay: float = 2.0):
                 keepalives_idle=30,
                 keepalives_interval=10,
                 keepalives_count=3,
+                # Kill any server-side query that runs >30s so a locked table
+                # or slow scan cannot hang the poll loop forever.
+                options="-c statement_timeout=30000",
             )
             return conn
         except psycopg2.OperationalError as e:
@@ -457,25 +460,31 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
     if not records:
         return 0, "❌ No valid records found in file."
 
+    # Bulk imports can take well over 30s on large CSVs — temporarily raise
+    # statement_timeout for this connection only. Default v5 timeout is 30s.
     with db_cursor() as cur:
-        # Upsert — update existing prices, insert new ones
-        # NEVER delete — price history stays forever
-        cur.executemany("""
-            INSERT INTO fuel_stops
-                (station_name, address, city, state, longitude, latitude,
-                 retail_price, discounted_price, price_updated)
-            VALUES
-                (%(station_name)s, %(address)s, %(city)s, %(state)s,
-                 %(longitude)s, %(latitude)s,
-                 %(retail_price)s, %(discounted_price)s, NOW())
-            ON CONFLICT (station_name, city, state) DO UPDATE SET
-                address          = EXCLUDED.address,
-                longitude        = EXCLUDED.longitude,
-                latitude         = EXCLUDED.latitude,
-                retail_price     = EXCLUDED.retail_price,
-                discounted_price = EXCLUDED.discounted_price,
-                price_updated    = NOW()
-        """, records)
+        cur.execute("SET LOCAL statement_timeout = '300000'")  # 5 min for this txn
+        # Upsert in chunks so we don't blow past timeout on huge files
+        CHUNK = 500
+        for i in range(0, len(records), CHUNK):
+            batch = records[i:i+CHUNK]
+            cur.executemany("""
+                INSERT INTO fuel_stops
+                    (station_name, address, city, state, longitude, latitude,
+                     retail_price, discounted_price, price_updated)
+                VALUES
+                    (%(station_name)s, %(address)s, %(city)s, %(state)s,
+                     %(longitude)s, %(latitude)s,
+                     %(retail_price)s, %(discounted_price)s, NOW())
+                ON CONFLICT (station_name, city, state) DO UPDATE SET
+                    address          = EXCLUDED.address,
+                    longitude        = EXCLUDED.longitude,
+                    latitude         = EXCLUDED.latitude,
+                    retail_price     = EXCLUDED.retail_price,
+                    discounted_price = EXCLUDED.discounted_price,
+                    price_updated    = NOW()
+            """, batch)
+            log.info(f"  CSV import: chunk {i//CHUNK + 1}/{(len(records) + CHUNK - 1)//CHUNK} ({len(batch)} rows)")
 
     msg = (
         f"✅ *Fuel prices updated*\n"

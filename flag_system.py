@@ -8,6 +8,10 @@ Three flag types:
 
 Flags are sent instantly to driver group + dispatcher group.
 Also stored in DB for weekly owner report.
+
+Schema note: the driver_flags table is created by database.py.init_db().
+This module does NOT re-create it — a split schema caused silent NULLs in
+card_price / savings_lost before.
 """
 
 import logging
@@ -21,38 +25,27 @@ FLAG_MISSED_STOP   = "MISSED_STOP"
 FLAG_LOW_STOP_STATE = "LOW_STOP_STATE"
 
 
-def _ensure_flags_table():
-    """Create flags table if not exists."""
-    with db_cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS driver_flags (
-                id              SERIAL PRIMARY KEY,
-                vehicle_name    TEXT NOT NULL,
-                flag_type       TEXT NOT NULL,
-                details         TEXT,
-                recommended_stop TEXT,
-                actual_stop     TEXT,
-                fuel_pct        REAL,
-                state           TEXT,
-                flagged_at      TIMESTAMPTZ DEFAULT NOW()
-            )
-        """)
-
-
 def save_flag(vehicle_name: str, flag_type: str, details: str,
               recommended_stop: str = None, actual_stop: str = None,
-              fuel_pct: float = None, state: str = None) -> int:
-    """Save a flag to DB. Returns flag ID."""
-    _ensure_flags_table()
+              fuel_pct: float = None, state: str = None,
+              card_price: float = None, savings_lost: float = None) -> int:
+    """Save a flag to DB. Returns flag ID.
+
+    card_price and savings_lost default to NULL. For MISSED_STOP we fill in
+    a projected savings_lost at insert time so weekly reports have a number
+    even if the driver hasn't refueled yet. state_machine.py overwrites it
+    with the real loss once the driver actually fuels elsewhere.
+    """
     with db_cursor() as cur:
         cur.execute("""
             INSERT INTO driver_flags
                 (vehicle_name, flag_type, details, recommended_stop,
-                 actual_stop, fuel_pct, state)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                 actual_stop, fuel_pct, state, card_price, savings_lost)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (vehicle_name, flag_type, details,
-               recommended_stop, actual_stop, fuel_pct, state))
+               recommended_stop, actual_stop, fuel_pct, state,
+               card_price, savings_lost))
         return cur.fetchone()["id"]
 
 
@@ -69,19 +62,40 @@ def send_flag(vehicle_name: str, flag_type: str, message: str,
 
 def flag_wrong_stop(vehicle_name: str, truck_group_id: str,
                      recommended: str, actual: str,
-                     fuel_before: float, fuel_after: float) -> None:
-    """Driver fueled at a different stop than recommended."""
+                     fuel_before: float, fuel_after: float,
+                     recommended_card_price: float = None,
+                     actual_card_price: float = None,
+                     tank_gal: float = 150) -> None:
+    """Driver fueled at a different stop than recommended.
+
+    If both card prices are known, we can compute the real savings_lost on
+    this very flag (no waiting for a refuel to back-fill).
+    """
+    # Estimate savings lost if we have both prices
+    savings_lost = None
+    if recommended_card_price and actual_card_price and fuel_before is not None:
+        gallons_added = round(tank_gal * max(fuel_after - fuel_before, 0) / 100, 1)
+        if gallons_added > 0 and actual_card_price > recommended_card_price:
+            savings_lost = round(
+                (actual_card_price - recommended_card_price) * gallons_added, 2
+            )
+
+    savings_line = (f"\n💸 *Savings lost: ${savings_lost:.2f}*"
+                    if savings_lost else "")
     msg = (
         f"🚩 *Flag — Truck {vehicle_name}*\n"
         f"Type: *Wrong Fuel Stop*\n\n"
         f"✅ Recommended: *{recommended}*\n"
         f"❌ Actual stop: *{actual}*\n"
-        f"⛽ Fuel: {fuel_before:.0f}% → {fuel_after:.0f}%\n\n"
+        f"⛽ Fuel: {fuel_before:.0f}% → {fuel_after:.0f}%"
+        f"{savings_line}\n\n"
         f"Driver did not follow the fuel recommendation."
     )
     save_flag(vehicle_name, FLAG_WRONG_STOP, msg,
               recommended_stop=recommended, actual_stop=actual,
-              fuel_pct=fuel_before)
+              fuel_pct=fuel_before,
+              card_price=recommended_card_price,
+              savings_lost=savings_lost)
     send_flag(vehicle_name, FLAG_WRONG_STOP, msg, truck_group_id)
 
 
@@ -90,16 +104,21 @@ def flag_missed_stop(vehicle_name: str, truck_group_id: str,
                       fuel_pct: float, tank_gal: float = 150,
                       card_price: float = None,
                       net_price: float = None) -> None:
-    """Driver passed the recommended stop without fueling."""
-    # Calculate exact savings lost based on recommended stop price
-    # gallons_needed = how much the driver needs to fill right now
-    # card_price     = what they would have paid at the recommended stop
-    # net_price      = IFTA-adjusted true cost at recommended stop
+    """Driver passed the recommended stop without fueling.
+
+    Records a PROJECTED savings_lost based on a conservative estimate of
+    what the driver will pay elsewhere. state_machine.py overwrites this
+    with the real loss once the driver actually refuels.
+    """
     savings_lost_line = ""
+    projected_loss = None
     if card_price and fuel_pct and tank_gal:
         gallons_needed  = round(tank_gal * (1 - fuel_pct / 100), 1)
         cost_at_rec     = round(card_price * gallons_needed, 2)
         net_at_rec      = round((net_price if net_price else card_price) * gallons_needed, 2)
+        # Projected loss: assume driver pays ~$0.15/gal more at a random stop.
+        # Real loss overwrites this on refuel (state_machine.py).
+        projected_loss  = round(0.15 * gallons_needed, 2) if gallons_needed > 0 else None
         savings_lost_line = (
             f"\n💸 *Would have cost: ${cost_at_rec:.0f}* at recommended stop"
             f"\n   (${card_price:.3f}/gal × {gallons_needed:.0f} gal)"
@@ -116,7 +135,8 @@ def flag_missed_stop(vehicle_name: str, truck_group_id: str,
         f"Finding next available stop ahead..."
     )
     save_flag(vehicle_name, FLAG_MISSED_STOP, msg,
-              recommended_stop=stop_name, fuel_pct=fuel_pct)
+              recommended_stop=stop_name, fuel_pct=fuel_pct,
+              card_price=card_price, savings_lost=projected_loss)
     send_flag(vehicle_name, FLAG_MISSED_STOP, msg, truck_group_id)
 
 
@@ -139,12 +159,11 @@ def flag_low_stop_state(vehicle_name: str, truck_group_id: str,
 
 def get_flags_summary(days: int = 7) -> dict:
     """Get flag summary for weekly report."""
-    _ensure_flags_table()
     from datetime import datetime, timezone, timedelta
     since = datetime.now(timezone.utc) - timedelta(days=days)
     with db_cursor() as cur:
         cur.execute("""
-            SELECT flag_type, COUNT(*) as cnt, 
+            SELECT flag_type, COUNT(*) as cnt,
                    array_agg(vehicle_name ORDER BY flagged_at DESC) as trucks
             FROM driver_flags
             WHERE flagged_at >= %s
