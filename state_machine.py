@@ -106,6 +106,7 @@ def _new_state(vid, data):
         "assigned_stop_name":     None,
         "assigned_stop_lat":      None,
         "assigned_stop_lng":      None,
+        "assigned_stop_net_price": None,
         "assignment_time":        None,
         "in_yard":                False,
         "yard_name":              None,
@@ -121,6 +122,9 @@ def _new_state(vid, data):
         "prev_truck_group":       None,
         "prev_truck_msg_id":      None,
         "prev_dispatcher_msg_id": None,
+        "missed_stop_name":       None,
+        "missed_stop_card_price": None,
+        "missed_stop_net_price":  None,
     }
 
 
@@ -130,6 +134,7 @@ def _clear_alert(state):
     state["assigned_stop_name"]   = None
     state["assigned_stop_lat"]    = None
     state["assigned_stop_lng"]    = None
+    state["assigned_stop_net_price"] = None
     state["assignment_time"]      = None
     state["alert_sent"]           = False
     state["overnight_alert_sent"] = False
@@ -141,6 +146,9 @@ def _clear_alert(state):
     state["last_alert_lat"]       = None
     state["last_alert_lng"]       = None
     state["last_alerted_fuel"]    = None
+    state["missed_stop_name"]       = None
+    state["missed_stop_card_price"] = None
+    state["missed_stop_net_price"]  = None
 
 
 def _get_truck_params(vehicle_name: str) -> tuple[float, float]:
@@ -304,6 +312,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     state["assigned_stop_lng"]        = next_stop.get("longitude") or next_stop.get("lng")
                     state["assigned_stop_dist"]       = next_stop.get("dist_from_truck", 0)
                     state["assigned_stop_card_price"] = next_stop.get("card_price") or next_stop.get("diesel_price")
+                    state["assigned_stop_net_price"]  = next_stop.get("net_price")
                     state["all_planned_stops"]        = plan["planned_stops"]
                     state["planned_stop_index"]       = 0
                 else:
@@ -313,6 +322,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     state["assigned_stop_lat"]        = None
                     state["assigned_stop_lng"]        = None
                     state["assigned_stop_card_price"] = None
+                    state["assigned_stop_net_price"]  = None
 
                 state["briefing_sent_trip"] = route_id
                 try:
@@ -752,22 +762,37 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 log.warning(f"  {vname}: stop visit logging failed: {e}")
 
         # ── Calculate REAL savings lost if driver missed a recommended stop ────
-        missed_stop_name  = state.get("missed_stop_name")
-        missed_stop_price = state.get("missed_stop_card_price")
+        missed_stop_name      = state.get("missed_stop_name")
+        missed_stop_price     = state.get("missed_stop_card_price")
+        missed_stop_net_price = state.get("missed_stop_net_price")
+        actual_net_price      = card_price
+        if actual_stop and card_price:
+            try:
+                from ifta import net_price_after_ifta
+                actual_net_price = net_price_after_ifta(card_price, actual_stop.get("state", ""))
+            except Exception:
+                actual_net_price = card_price
+
         if missed_stop_name and missed_stop_price and card_price and gallons_added > 0:
-            real_loss = round((card_price - missed_stop_price) * gallons_added, 2)
+            compare_rec_price = missed_stop_net_price if missed_stop_net_price is not None else missed_stop_price
+            compare_act_price = actual_net_price if missed_stop_net_price is not None else card_price
+            real_loss = round((compare_act_price - compare_rec_price) * gallons_added, 2)
             if real_loss > 0:
                 from telegram_bot import _send_to, _send_to_dispatcher
                 from database import get_truck_group, db_cursor
                 truck_group = get_truck_group(vname)
                 NL = chr(10)
+                if missed_stop_net_price is not None:
+                    price_label = "Net after IFTA"
+                else:
+                    price_label = "Card price"
                 loss_msg = (
                     f"🚩 *Updated Flag — Truck {vname}*" + NL +
                     f"❌ Missed: *{missed_stop_name}* → ${missed_stop_price:.3f}/gal" + NL +
                     f"✅ Fueled at: *{actual_name}* → ${card_price:.3f}/gal" + NL +
                     f"⛽ Filled: {gallons_added:.0f} gal" + NL +
                     f"💸 *Real savings lost: ${real_loss:.2f}*" + NL +
-                    f"   (${card_price:.3f} - ${missed_stop_price:.3f}) × {gallons_added:.0f} gal"
+                    f"   {price_label}: (${compare_act_price:.3f} - ${compare_rec_price:.3f}) × {gallons_added:.0f} gal"
                 )
                 if truck_group:
                     _send_to(truck_group, loss_msg)
@@ -788,6 +813,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                          f"({missed_stop_name} → {actual_name})")
             state["missed_stop_name"]       = None
             state["missed_stop_card_price"] = None
+            state["missed_stop_net_price"]  = None
 
         # ── Advance to next planned stop ─────────────────────────────────────
         all_planned = state.get("all_planned_stops", [])
@@ -801,6 +827,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
             state["assigned_stop_lat"]  = next_stop.get("latitude")
             state["assigned_stop_lng"]  = next_stop.get("longitude")
             state["assigned_stop_card_price"] = next_stop.get("card_price") or next_stop.get("diesel_price")
+            state["assigned_stop_net_price"] = next_stop.get("net_price")
             state["planned_stop_index"] = next_idx
             log.info(f"  {vname}: next planned stop → {next_stop['store_name']}")
         else:
@@ -808,6 +835,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
             state["assigned_stop_lat"]  = None
             state["assigned_stop_lng"]  = None
             state["assigned_stop_card_price"] = None
+            state["assigned_stop_net_price"] = None
 
         if state.get("open_alert_id"):
             resolve_alert(state["open_alert_id"])
@@ -919,6 +947,8 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     if planned_stops and planned_idx < len(planned_stops):
                         ps        = planned_stops[planned_idx]
                         net_price = ps.get("net_price")
+                    if net_price is None:
+                        net_price = state.get("assigned_stop_net_price")
 
                     flag_missed_stop(
                         vehicle_name=vname,
@@ -933,6 +963,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     # Save for real loss calculation when driver fuels elsewhere
                     state["missed_stop_name"]       = state.get("assigned_stop_name")
                     state["missed_stop_card_price"] = card_price
+                    state["missed_stop_net_price"]  = net_price
                     try:
                         from database import save_trip_state
                         save_trip_state(vname, state)
