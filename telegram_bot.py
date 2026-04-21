@@ -465,20 +465,28 @@ def poll_for_uploads():
             # Commands for any group
             if text.startswith("/loadroute"):
                 _handle_loadroute(text, chat_id)
+                continue
             elif text.startswith("/route"):
                 _handle_route(text, chat_id)
+                continue
             elif text.startswith("/qmload"):
                 _handle_qmload(text, chat_id)
+                continue
             elif text.startswith("/newalert"):
                 _handle_newalert(text)
+                continue
             elif text.startswith("/flags"):
                 _handle_flags(text, chat_id)
+                continue
             elif text.startswith("/stopvisits"):
                 _handle_stopvisits(text, chat_id)
+                continue
             elif text.startswith("/compliance"):
                 _handle_compliance(text, chat_id)
+                continue
             elif text.startswith("/fuelhistory"):
                 _handle_fuelhistory(text, chat_id)
+                continue
             elif text.startswith("/findstop"):
                 try:
                     _handle_findstop(text, chat_id)

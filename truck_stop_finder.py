@@ -280,6 +280,7 @@ def find_best_stops(
     tank_gal: float = DEFAULT_TANK_GAL,
     mpg: float = DEFAULT_MPG,
     truck_state: str = "",
+    max_radius: float | None = None,
 ) -> tuple[dict | None, dict | None]:
     """
     Find the best 2 diesel stops for a truck.
@@ -299,6 +300,8 @@ def find_best_stops(
     # Always search 100 miles in heading direction for best price comparison
     # Urgency radius only used as safety fallback for EMERGENCY
     radius        = 60.0 if urgency == "EMERGENCY" else 100.0
+    if max_radius is not None:
+        radius = min(radius, float(max_radius))
     price_matters = urgency in ("ADVISORY", "WARNING")
 
     log.info(f"Stop finder: urgency={urgency} radius={radius:.0f}mi "
@@ -472,6 +475,7 @@ def find_best_stops_on_route(
     tank_gal: float = DEFAULT_TANK_GAL,
     mpg: float = DEFAULT_MPG,
     truck_heading: float = 0.0,
+    max_radius: float | None = None,
 ) -> tuple[dict | None, dict | None]:
     """
     Find best fuel stop along the actual route from QuickManage.
@@ -501,6 +505,8 @@ def find_best_stops_on_route(
 
     # Search radius based on fuel level
     search_radius = 100.0 if fuel_pct >= 30 else 50.0
+    if max_radius is not None:
+        search_radius = min(search_radius, float(max_radius))
 
     # Build route segments: truck → each upcoming stop → destination
     # This follows the actual highway path instead of a straight line
