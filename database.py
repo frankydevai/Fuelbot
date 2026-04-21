@@ -448,31 +448,69 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
                       Retail price, Discounted price
     Clears existing data and reloads fresh every time (daily upload).
     """
-    import csv, io
+    import csv, io, re
+
+    def _norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
+
+    def _pick(row: dict, aliases: tuple[str, ...], default: str = "") -> str:
+        for alias in aliases:
+            actual = header_map.get(_norm(alias))
+            if actual is not None:
+                return str(row.get(actual, default) or "").strip()
+        return default
+
+    def _to_float(value: str):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        text = text.replace("$", "").replace(",", "")
+        return float(text)
     try:
         text   = file_bytes.decode("utf-8-sig")
         reader = csv.DictReader(io.StringIO(text))
+        if not reader.fieldnames:
+            return 0, "CSV file is missing a header row."
         rows   = list(reader)
     except Exception as e:
         return 0, f"❌ Could not parse file: {e}"
+
+    header_map = {_norm(name): name for name in (reader.fieldnames or [])}
+    required_groups = {
+        "station": ("Station", "station_name", "store_name", "name"),
+        "city": ("City", "city"),
+        "state": ("State", "state"),
+        "latitude": ("latitude", "lat"),
+        "longitude": ("longitude", "lng", "lon"),
+        "discounted_price": (
+            "Discounted price", "discounted_price", "discount_price",
+            "card price", "card_price", "diesel_price",
+        ),
+    }
+    missing = [
+        group for group, aliases in required_groups.items()
+        if not any(_norm(alias) in header_map for alias in aliases)
+    ]
+    if missing:
+        return 0, "CSV missing required columns: " + ", ".join(missing)
 
     records = []
     skipped = 0
     for r in rows:
         try:
-            lat  = float(r["latitude"])
-            lng  = float(r["longitude"])
-            name = r["Station"].strip()
-            city  = r["City"].strip()
-            state = r["State"].strip().upper()
-            if not name or not state or not lat or not lng:
+            lat = _to_float(_pick(r, required_groups["latitude"]))
+            lng = _to_float(_pick(r, required_groups["longitude"]))
+            name = _pick(r, required_groups["station"])
+            city = _pick(r, required_groups["city"])
+            state = _pick(r, required_groups["state"]).upper()
+            retail = _to_float(_pick(r, ("Retail price", "retail_price", "retail", "pump_price")))
+            discount = _to_float(_pick(r, required_groups["discounted_price"]))
+            if not name or not state or lat is None or lng is None or discount is None:
                 skipped += 1
                 continue
-            retail   = float(r["Retail price"])   if r.get("Retail price","").strip()    else None
-            discount = float(r["Discounted price"]) if r.get("Discounted price","").strip() else None
             records.append({
                 "station_name":     name,
-                "address":          r.get("Address","").strip(),
+                "address":          _pick(r, ("Address", "address", "street_address")),
                 "city":             city,
                 "state":            state,
                 "longitude":        lng,
@@ -489,6 +527,7 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
     with db_cursor() as cur:
         # Upsert — update existing prices, insert new ones
         # NEVER delete — price history stays forever
+        cur.execute("TRUNCATE TABLE fuel_stops RESTART IDENTITY")
         cur.executemany("""
             INSERT INTO fuel_stops
                 (station_name, address, city, state, longitude, latitude,
@@ -497,13 +536,6 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
                 (%(station_name)s, %(address)s, %(city)s, %(state)s,
                  %(longitude)s, %(latitude)s,
                  %(retail_price)s, %(discounted_price)s, NOW())
-            ON CONFLICT (station_name, city, state) DO UPDATE SET
-                address          = EXCLUDED.address,
-                longitude        = EXCLUDED.longitude,
-                latitude         = EXCLUDED.latitude,
-                retail_price     = EXCLUDED.retail_price,
-                discounted_price = EXCLUDED.discounted_price,
-                price_updated    = NOW()
         """, records)
 
     msg = (

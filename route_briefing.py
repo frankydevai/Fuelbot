@@ -40,6 +40,29 @@ def _gallons_to_full(fuel_pct: float, tank_gal: float) -> float:
     return round(tank_gal * (1 - fuel_pct / 100), 1)
 
 
+def _can_continue_after_stop(
+    stop: dict,
+    total_dist: float,
+    all_candidates: list[dict],
+    fill_to_pct: float,
+    tank_gal: float,
+    mpg: float,
+) -> bool:
+    """Whether stopping here still allows the route to continue after refueling."""
+    dist_to_stop = stop["dist_from_truck"]
+    post_fill_range = _reachable_miles(fill_to_pct, tank_gal, mpg)
+
+    if post_fill_range >= (total_dist - dist_to_stop):
+        return True
+
+    next_candidates = [
+        s for s in all_candidates
+        if s["dist_from_truck"] > dist_to_stop + 5
+        and (s["dist_from_truck"] - dist_to_stop) <= post_fill_range
+    ]
+    return bool(next_candidates)
+
+
 def _stops_on_segment(from_lat, from_lng, to_lat, to_lng,
                        all_stops, exclude_names=None) -> list:
     """
@@ -239,42 +262,39 @@ def plan_route_briefing(
     sim_fuel = current_fuel_pct
     sim_dist = 0.0
 
-    for s in unique_candidates:
-        dist_to_stop  = s["dist_from_truck"]
-        miles_to_stop = dist_to_stop - sim_dist
-
-        if miles_to_stop <= 0:
-            continue  # already past this stop in simulation
-
-        # Can truck reach this stop on current simulated fuel?
+    while sim_dist < total_dist:
         range_now = _reachable_miles(sim_fuel, tank_gal, mpg)
-        if range_now < miles_to_stop:
-            # Can't reach this stop — truck would run out before it
-            # This means we missed a stop earlier — warn and continue
-            warnings.append(
-                f"⚠️ Cannot reach {s['store_name']} ({s['city']}, {s['state']}) "
-                f"— {miles_to_stop:.0f}mi needed but only {range_now:.0f}mi range"
+        max_reach_dist = sim_dist + range_now
+
+        if max_reach_dist >= total_dist:
+            break
+
+        reachable_candidates = [
+            s for s in unique_candidates
+            if sim_dist < s["dist_from_truck"] <= max_reach_dist
+        ]
+        viable_candidates = [
+            s for s in reachable_candidates
+            if _can_continue_after_stop(
+                s, total_dist, unique_candidates, FILL_TO, tank_gal, mpg
             )
-            continue
+        ]
 
-        # Can truck skip this stop and still reach the NEXT waypoint?
-        next_stops = [x for x in unique_candidates if x["dist_from_truck"] > dist_to_stop + 5]
-        next_dist  = next_stops[0]["dist_from_truck"] if next_stops else total_dist
-        miles_to_next = next_dist - sim_dist
+        if not viable_candidates:
+            warnings.append(
+                f"No reachable fuel stop found within {range_now:.0f} miles of current range."
+            )
+            break
 
-        # Fuel arriving at THIS stop
+        # Pick the cheapest reachable stop that still keeps the trip feasible.
+        s = min(
+            viable_candidates,
+            key=lambda stop: (stop["net_price"], -stop["dist_from_truck"])
+        )
+
+        dist_to_stop = s["dist_from_truck"]
+        miles_to_stop = dist_to_stop - sim_dist
         fuel_arrival = sim_fuel - (miles_to_stop / mpg / tank_gal) * 100
-        # Fuel arriving at NEXT stop if we fill up here first
-        fuel_after_fill = FILL_TO - ((next_dist - dist_to_stop) / mpg / tank_gal) * 100
-
-        # Can we skip? Only if truck can reach next stop WITHOUT stopping here
-        range_from_here = _reachable_miles(max(fuel_arrival, 0), tank_gal, mpg)
-        can_skip = range_from_here >= (miles_to_next - miles_to_stop + 20)  # 20mi safety
-
-        if can_skip:
-            continue  # truck has enough fuel to skip this stop
-
-        # Stop here — truck needs fuel
         gal_to_fill = round((FILL_TO - max(fuel_arrival, 5)) / 100 * tank_gal, 1)
         gal_to_fill = max(min(gal_to_fill, tank_gal * 0.95), 15)  # min 15 gal
 
@@ -309,13 +329,8 @@ def plan_route_briefing(
         used_names.add(s["store_name"])
         stop_number += 1
 
-        # After filling — update simulation position and fuel
         sim_fuel = FILL_TO
         sim_dist = dist_to_stop
-
-        # Done if truck can reach destination from here
-        if _reachable_miles(sim_fuel, tank_gal, mpg) >= (total_dist - sim_dist):
-            break
 
         # ── Border strategy analysis ──────────────────────────────────────────
     # Build waypoints with CUMULATIVE along-route distance (not straight-line)
@@ -450,14 +465,10 @@ def format_route_briefing(plan: dict, truck_name: str,
         ]
         return "\n".join(lines)
 
-    if plan["warnings"]:
-        for w in plan["warnings"]:
-            lines.append(w)
-        lines.append("")
-
     if not plan["planned_stops"]:
-        lines.append("❌ No suitable fuel stops found on this route.")
+        lines.append("No fuel stop recommendation is available for this route yet.")
         return "\n".join(lines)
+
 
     total = plan["stops_needed"]
     lines.append(f"⛽ *First fuel stop* (trip needs ~{total} stop{'s' if total > 1 else ''} total):")
