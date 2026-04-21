@@ -788,11 +788,12 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     price_label = "Card price"
                 loss_msg = (
                     f"🚩 *Updated Flag — Truck {vname}*" + NL +
-                    f"❌ Missed: *{missed_stop_name}* → ${missed_stop_price:.3f}/gal" + NL +
+                    f"🧾 Type: *Missed Stop Loss Update*" + NL +
+                    f"❌ Missed stop: *{missed_stop_name}* → ${missed_stop_price:.3f}/gal" + NL +
                     f"✅ Fueled at: *{actual_name}* → ${card_price:.3f}/gal" + NL +
                     f"⛽ Filled: {gallons_added:.0f} gal" + NL +
                     f"💸 *Real savings lost: ${real_loss:.2f}*" + NL +
-                    f"   {price_label}: (${compare_act_price:.3f} - ${compare_rec_price:.3f}) × {gallons_added:.0f} gal"
+                    f"📊 {price_label}: (${compare_act_price:.3f} - ${compare_rec_price:.3f}) × {gallons_added:.0f} gal"
                 )
                 if truck_group:
                     _send_to(truck_group, loss_msg)
