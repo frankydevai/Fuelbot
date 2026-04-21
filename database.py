@@ -466,6 +466,23 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
             return None
         text = text.replace("$", "").replace(",", "")
         return float(text)
+
+    def _norm_address(value: str) -> str:
+        text = str(value or "").strip().lower()
+        replacements = {
+            " street": " st",
+            " road": " rd",
+            " avenue": " ave",
+            " boulevard": " blvd",
+            " highway": " hwy",
+            " drive": " dr",
+            " lane": " ln",
+            " place": " pl",
+            " court": " ct",
+        }
+        for src, dst in replacements.items():
+            text = text.replace(src, dst)
+        return re.sub(r"[^a-z0-9]+", "", text)
     try:
         text   = file_bytes.decode("utf-8-sig")
         reader = csv.DictReader(io.StringIO(text))
@@ -497,6 +514,7 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
     records = []
     skipped = 0
     duplicates = 0
+    conflicts = 0
     for r in rows:
         try:
             lat = _to_float(_pick(r, required_groups["latitude"]))
@@ -524,6 +542,48 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
 
     if not records:
         return 0, "No valid records found in file."
+
+    # Reject conflicting rows that point to the same physical location/address
+    # but claim different city/state values. This protects routing from bad
+    # cleaned CSV merges like "Columbia, SC" with NJ coordinates.
+    conflict_indexes = set()
+    coord_groups = {}
+    addr_groups = {}
+    for idx, record in enumerate(records):
+        coord_key = (
+            round(float(record["latitude"]), 3),
+            round(float(record["longitude"]), 3),
+        )
+        coord_groups.setdefault(coord_key, []).append((idx, record))
+
+        addr_key = _norm_address(record.get("address", ""))
+        if addr_key:
+            addr_groups.setdefault(addr_key, []).append((idx, record))
+
+    def _mark_conflicts(groups: dict):
+        nonlocal conflicts
+        for items in groups.values():
+            locations = {
+                (
+                    str(rec.get("city", "")).strip().upper(),
+                    str(rec.get("state", "")).strip().upper(),
+                )
+                for _, rec in items
+                if rec.get("state")
+            }
+            if len(locations) > 1:
+                for idx, _ in items:
+                    if idx not in conflict_indexes:
+                        conflict_indexes.add(idx)
+                        conflicts += 1
+
+    _mark_conflicts(coord_groups)
+    _mark_conflicts(addr_groups)
+    if conflict_indexes:
+        records = [
+            record for idx, record in enumerate(records)
+            if idx not in conflict_indexes
+        ]
 
     deduped = {}
     for record in records:
@@ -553,6 +613,7 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
         f"Fuel prices updated\n"
         f"{len(records)} stations loaded\n"
         f"{skipped} skipped (missing data)\n"
+        f"{conflicts} conflicting rows rejected\n"
         f"{duplicates} duplicate rows merged\n"
         f"Using discounted (card) price for routing"
     )

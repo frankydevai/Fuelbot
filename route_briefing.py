@@ -80,6 +80,20 @@ def _choose_best_route_stop(
     return min(pool, key=lambda stop: (stop["net_price"], -stop["dist_from_truck"]))
 
 
+def _is_waypoint_ahead(
+    truck_lat: float,
+    truck_lng: float,
+    dest_lat: float,
+    dest_lng: float,
+    wp_lat: float,
+    wp_lng: float,
+) -> bool:
+    """Keep only waypoints generally ahead toward the destination."""
+    route_bearing = bearing(truck_lat, truck_lng, dest_lat, dest_lng)
+    wp_bearing = bearing(truck_lat, truck_lng, wp_lat, wp_lng)
+    return angle_diff(route_bearing, wp_bearing) <= 100
+
+
 def _stops_on_segment(from_lat, from_lng, to_lat, to_lng,
                        all_stops, exclude_names=None) -> list:
     """
@@ -154,58 +168,45 @@ def plan_route_briefing(
     """
     Plan ALL fuel stops needed for entire route from current position.
 
-    Returns:
-    {
-        "stops_needed": int,
-        "planned_stops": [
-            {
-                "stop_number": 1,
-                "store_name": "Love's #609",
-                "address": "...", "city": "...", "state": "TX",
-                "dist_from_truck": 245.3,
-                "card_price": 4.32,
-                "retail_price": 5.40,
-                "net_price": 4.435,
-                "ifta_rate": 0.200,
-                "gallons_to_fill": 102,
-                "total_card_cost": 440.64,
-                "total_net_cost": 452.37,
-                "maps_url": "https://maps.google.com/?q=...",
-                "low_stop_warning": None or "⚠️ Last stop before MD",
-            }
-        ],
-        "total_distance": 1240,
-        "total_card_cost": 890.50,
-        "total_net_cost":  920.30,
-        "warnings": [],
-        "can_complete_without_stop": False,
-    }
+    Returns a full route plan with the first recommended stop, all planned stops,
+    and any border-fuel strategy decisions.
     """
     all_stops = get_all_diesel_stops()
     stops_raw = route.get("stops", [])
     dest      = route.get("destination", {})
+    dest_lat  = float(dest["lat"]) if dest.get("lat") else None
+    dest_lng  = float(dest["lng"]) if dest.get("lng") else None
 
-    # Build waypoints: current pos → all route stops with coords → destination
+    # Build waypoints: current pos -> remaining route stops with coords -> destination.
+    # For in_transit trips, completed pickup legs are behind the truck and should not
+    # influence border strategy or first-stop selection.
     waypoints = [{"lat": truck_lat, "lng": truck_lng}]
     for s in stops_raw:
         if s.get("lat") and s.get("lng"):
-            wp_dist = haversine_miles(truck_lat, truck_lng,
-                                      float(s["lat"]), float(s["lng"]))
+            wp_lat = float(s["lat"])
+            wp_lng = float(s["lng"])
+            if str(route.get("status", "")).lower() == "in_transit" and s.get("pickup"):
+                continue
+            wp_dist = haversine_miles(truck_lat, truck_lng, wp_lat, wp_lng)
             if wp_dist > 1.0:
+                if dest_lat is not None and dest_lng is not None:
+                    if not _is_waypoint_ahead(truck_lat, truck_lng, dest_lat, dest_lng, wp_lat, wp_lng):
+                        continue
                 waypoints.append({
-                    "lat":   float(s["lat"]),
-                    "lng":   float(s["lng"]),
+                    "lat":   wp_lat,
+                    "lng":   wp_lng,
                     "city":  s.get("city", ""),
                     "state": s.get("state", ""),
                 })
 
-    if dest.get("lat") and dest.get("lng"):
+    if dest_lat is not None and dest_lng is not None:
         waypoints.append({
-            "lat":   float(dest["lat"]),
-            "lng":   float(dest["lng"]),
+            "lat":   dest_lat,
+            "lng":   dest_lng,
             "city":  dest.get("city", ""),
             "state": dest.get("state", ""),
         })
+
 
     if len(waypoints) < 2:
         return {"error": "Not enough route waypoints with coordinates"}
