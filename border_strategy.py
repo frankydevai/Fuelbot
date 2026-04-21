@@ -313,34 +313,17 @@ def build_border_strategy(
                 truck_heading=truck_heading,
             )
 
-            # ── REACHABILITY CHECK ─────────────────────────────────────────────
-            # Can truck physically REACH this pre-border stop on current fuel?
-            # Use 85% safety margin (same as other range calcs).
-            can_reach_stop = True
-            if stop:
-                stop_dist = stop.get("dist_from_truck", event.dist_to_entry)
-                # fuel_sim is fuel at CURRENT dist_position, so gallons needed
-                # is from here to the stop
-                miles_to_stop = max(stop_dist - dist_position, 0)
-                range_on_sim  = (fuel_sim / 100.0) * tank_gal * mpg * 0.85
-                can_reach_stop = range_on_sim >= miles_to_stop
-            # If truck would arrive at pre-border stop too empty to be safe,
-            # the route_briefing planner must insert an earlier emergency stop.
-            needs_earlier_stop = (fuel_sim < 10) or (not can_reach_stop)
-
             decisions.append({
-                "event":              event,
-                "action":              "fuel_before_border",
-                "reason":              (
+                "event":        event,
+                "action":       "fuel_before_border",
+                "reason":       (
                     f"Must enter {event.state_name} with ≥{fill_to_pct:.0f}% fuel"
                     + (" — expensive state" if event.is_avoid else "")
                     + (" — very few truck stops" if event.is_low_stop else "")
                 ),
-                "stop":                stop,
-                "fill_to_pct":         fill_to_pct,
-                "fill_gallons":        gal_to_add,
-                "fuel_sim_at_stop":    round(fuel_sim, 1),  # for diagnostics
-                "needs_earlier_stop":  needs_earlier_stop,
+                "stop":         stop,
+                "fill_to_pct":  fill_to_pct,
+                "fill_gallons": gal_to_add,
             })
 
             # Simulate after fill

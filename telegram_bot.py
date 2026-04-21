@@ -4,7 +4,6 @@ telegram_bot.py  -  Telegram message sending for FleetFuel bot.
 
 import time
 import logging
-import threading
 import requests
 from config import TELEGRAM_BOT_TOKEN, DISPATCHER_GROUP_ID, ADMIN_CHAT_ID, MIN_SAVINGS_DISPLAY
 
@@ -14,31 +13,22 @@ force_check_now: bool = False
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 
-def _post(method: str, payload: dict, retries: int = 2) -> dict | None:
-    """
-    Send a Telegram API call with bounded retries.
-
-    Total max blocking time: ~10s + 2*(2s sleep + 10s timeout) = ~34s worst case.
-    This used to be 70s (4 retries × ~15s each) which compounded across the
-    fleet to multi-minute blocking on a single poll cycle when Telegram was
-    degraded. Bounded retries keep the poll loop responsive.
-    """
+def _post(method: str, payload: dict, retries: int = 4) -> dict | None:
     for attempt in range(retries + 1):
         try:
             resp = requests.post(f"{BASE_URL}/{method}", json=payload, timeout=10)
             if resp.status_code == 429:
-                # Rate-limited — Telegram tells us how long to wait.
-                # Cap at 5s so a single rate-limit can't stall the loop.
-                wait = min(resp.json().get("parameters", {}).get("retry_after", 2), 5)
+                wait = max(resp.json().get("parameters", {}).get("retry_after", 5), 5)
+                wait *= (attempt + 1)
                 log.warning(f"Telegram 429 — waiting {wait}s")
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException as exc:
-            log.error(f"Telegram {method} failed (attempt {attempt+1}/{retries+1}): {exc}")
+            log.error(f"Telegram {method} failed (attempt {attempt+1}): {exc}")
             if attempt < retries:
-                time.sleep(2)  # short fixed backoff
+                time.sleep(3 * (attempt + 1))
     return None
 
 
@@ -67,12 +57,7 @@ def _send_to_truck(vehicle_name: str, text: str) -> dict:
     if truck_group:
         truck_msg_id = _send_to(truck_group, text)
     else:
-        # Loud warning — driver gets nothing until you link the group.
-        # This is the #1 reason "no driver messages arriving" happens.
-        log.warning(
-            f"⚠️  Truck {vehicle_name} has NO Telegram group linked. "
-            f"Driver will receive nothing. Fix with: /setgroup {vehicle_name} <GROUP_ID>"
-        )
+        log.info(f"No group set for {vehicle_name} — dispatcher only")
     if DISPATCHER_GROUP_ID and truck_group != str(DISPATCHER_GROUP_ID):
         dispatcher_msg_id = _send_to_dispatcher(text)
     return {"truck_group": truck_group, "truck_msg_id": truck_msg_id, "dispatcher_msg_id": dispatcher_msg_id}
@@ -283,15 +268,7 @@ def send_ca_border_reminder(vehicle_name, fuel_pct, truck_lat, truck_lng,
     return _send_to_truck(vehicle_name, "\n".join(lines))
 
 
-def send_at_stop_alert(vehicle_name, fuel_pct, truck_lat, truck_lng, current_stop,
-                       assigned_stop_name=None, assigned_stop_card_price=None) -> dict:
-    """Alert when truck is parked at a fuel stop.
-
-    If assigned_stop_name is provided, the message indicates whether the
-    truck is at the recommended stop (✅) or a different one (🚩). The
-    actual flag insert + savings_lost calculation is done by the caller
-    after this function returns.
-    """
+def send_at_stop_alert(vehicle_name, fuel_pct, truck_lat, truck_lng, current_stop) -> dict:
     emoji     = _urgency_emoji(fuel_pct)
     truck_url = f"https://maps.google.com/?q={truck_lat:.6f},{truck_lng:.6f}"
     name      = current_stop.get("store_name", "Fuel Stop")
@@ -300,33 +277,6 @@ def send_at_stop_alert(vehicle_name, fuel_pct, truck_lat, truck_lng, current_sto
     price     = current_stop.get("diesel_price")
     slat      = current_stop.get("latitude"); slng = current_stop.get("longitude")
     maps_url  = f"https://maps.google.com/?q={slat},{slng}" if slat and slng else None
-
-    # Compare to recommended stop
-    is_match = False
-    match_line = ""
-    if assigned_stop_name:
-        # Loose match — same brand+number is good enough
-        a = (assigned_stop_name or "").strip().upper()
-        c = (name or "").strip().upper()
-        is_match = (a == c) or (a in c) or (c in a)
-        if is_match:
-            match_line = f"✅ *This is your recommended stop*"
-        else:
-            # Compute approximate savings lost if we have both prices
-            loss_line = ""
-            if assigned_stop_card_price and price and price > assigned_stop_card_price:
-                # Conservative: assume driver fills 100 gallons (typical refuel)
-                est_gal  = 100
-                est_loss = round((float(price) - float(assigned_stop_card_price)) * est_gal, 2)
-                loss_line = (
-                    f"\n💸 *Estimated loss: ~${est_loss:.0f}*"
-                    f"  (${price:.3f} vs recommended ${assigned_stop_card_price:.3f}/gal × ~{est_gal} gal)"
-                )
-            match_line = (
-                f"🚩 *Wrong stop* — recommended: *{assigned_stop_name}*"
-                f"{loss_line}"
-            )
-
     lines = [
         f"{emoji} *Low Fuel Alert — Truck {vehicle_name}*",
         f"⛽ Fuel: *{fuel_pct:.0f}%*",
@@ -335,9 +285,6 @@ def send_at_stop_alert(vehicle_name, fuel_pct, truck_lat, truck_lng, current_sto
         f"⛽ *{name}*", f"📌 {address}",
         f"💰 Diesel: *${price:.3f}/gal*" if price else "💰 Diesel: Price N/A",
     ]
-    if match_line:
-        lines.append("")
-        lines.append(match_line)
     if maps_url:
         lines.append(f"🗺 [Open in Google Maps]({maps_url})")
     return _send_to_truck(vehicle_name, "\n".join(lines))
@@ -406,59 +353,14 @@ def register_commands():
 
 def send_startup_message():
     register_commands()
-    # Audit: count trucks with and without group IDs, surface the gap to admin
-    try:
-        from database import db_cursor
-        with db_cursor() as cur:
-            cur.execute("""
-                SELECT COUNT(*) FILTER (WHERE telegram_group_id IS NOT NULL AND telegram_group_id != '') AS linked,
-                       COUNT(*) FILTER (WHERE telegram_group_id IS NULL OR telegram_group_id = '')      AS unlinked,
-                       array_agg(vehicle_name ORDER BY vehicle_name) FILTER (
-                           WHERE telegram_group_id IS NULL OR telegram_group_id = ''
-                       ) AS unlinked_names
-                FROM trucks WHERE is_active = TRUE
-            """)
-            row = cur.fetchone()
-        linked   = row["linked"] or 0
-        unlinked = row["unlinked"] or 0
-        names    = row["unlinked_names"] or []
-        if unlinked > 0:
-            preview = ", ".join(names[:10]) + ("..." if len(names) > 10 else "")
-            msg = (
-                f"🚛 *FleetFuel Bot online.*\n"
-                f"✅ {linked} trucks linked to groups\n"
-                f"⚠️ *{unlinked} trucks have NO Telegram group* — drivers will not receive alerts:\n"
-                f"`{preview}`\n\n"
-                f"Fix with: `/setgroup TRUCKNAME GROUP_ID` for each."
-            )
-        else:
-            msg = f"🚛 *FleetFuel Bot online.* All {linked} trucks linked. Monitoring fuel levels."
-        _send_to(ADMIN_CHAT_ID, msg)
-    except Exception as e:
-        log.warning(f"Startup audit failed: {e}")
-        _send_to(ADMIN_CHAT_ID, "🚛 *FleetFuel Bot online.* Monitoring fuel levels.")
+    _send_to(ADMIN_CHAT_ID, "🚛 *FleetFuel Bot online.* Monitoring fuel levels.")
 
 
 def send_price_update_notification(pilot_count, loves_count):
     log.info(f"Prices updated: Pilot={pilot_count} Love's={loves_count}")
 
 
-def _load_last_update_id() -> int:
-    try:
-        from database import get_config_value
-        val = get_config_value("telegram_last_update_id")
-        return int(val) if val else 0
-    except Exception:
-        return 0
-
-def _save_last_update_id(uid: int) -> None:
-    try:
-        from database import set_config_value
-        set_config_value("telegram_last_update_id", str(uid))
-    except Exception:
-        pass
-
-_last_update_id: int = _load_last_update_id()
+_last_update_id: int = 0
 
 
 def _get_file_url(file_id):
@@ -492,7 +394,6 @@ def poll_for_uploads():
             return
         for update in result.get("result", []):
             _last_update_id = update["update_id"]
-            _save_last_update_id(_last_update_id)
 
             # Bot added to group
             chat_member = update.get("my_chat_member", {})
@@ -564,22 +465,20 @@ def poll_for_uploads():
             if text.startswith("/loadroute"):
                 _handle_loadroute(text, chat_id)
             elif text.startswith("/route"):
-                threading.Thread(target=lambda t=text, c=chat_id: _handle_route(t, c), daemon=True).start()
+                _handle_route(text, chat_id)
             elif text.startswith("/newalert"):
                 _handle_newalert(text)
             elif text.startswith("/flags"):
-                threading.Thread(target=lambda t=text, c=chat_id: _handle_flags(t, c), daemon=True).start()
-            elif text.startswith("/cheaters"):
-                threading.Thread(target=lambda t=text, c=chat_id: _handle_cheaters(t, c), daemon=True).start()
+                _handle_flags(text, chat_id)
             elif text.startswith("/stopvisits"):
-                threading.Thread(target=lambda t=text, c=chat_id: _handle_stopvisits(t, c), daemon=True).start()
+                _handle_stopvisits(text, chat_id)
             elif text.startswith("/compliance"):
-                threading.Thread(target=lambda t=text, c=chat_id: _handle_compliance(t, c), daemon=True).start()
+                _handle_compliance(text, chat_id)
             elif text.startswith("/fuelhistory"):
-                threading.Thread(target=lambda t=text, c=chat_id: _handle_fuelhistory(t, c), daemon=True).start()
+                _handle_fuelhistory(text, chat_id)
             elif text.startswith("/findstop"):
                 try:
-                    threading.Thread(target=lambda t=text, c=chat_id: _handle_findstop(t, c), daemon=True).start()
+                    _handle_findstop(text, chat_id)
                 except Exception as e:
                     _send_to(chat_id, f"❌ Error: `{e}`")
                 continue
@@ -598,11 +497,11 @@ def poll_for_uploads():
                     elif text.startswith("/checknow"):     _handle_checknow()
                     elif text.startswith("/dbstats"):      _handle_dbstats()
                     elif text.startswith("/resetpilot"):   _handle_resetpilot()
-                    elif text.startswith("/findload"):     threading.Thread(target=lambda t=text, c=chat_id: _handle_findload(t, c), daemon=True).start()
+                    elif text.startswith("/findload"):     _handle_findload(text, chat_id)
                     elif text.startswith("/testroute"):    _handle_testroute(text)
-                    elif text.startswith("/planroute"):     threading.Thread(target=lambda t=text, c=chat_id: _handle_planroute(t, c), daemon=True).start()
-                    elif text.startswith("/truckstats"):    threading.Thread(target=lambda t=text, c=chat_id: _handle_truckstats(t, c), daemon=True).start()
-                    elif text.startswith("/routelist"):     threading.Thread(target=lambda c=chat_id: _handle_routelist(c), daemon=True).start()
+                    elif text.startswith("/planroute"):     _handle_planroute(text, chat_id)
+                    elif text.startswith("/truckstats"):    _handle_truckstats(text, chat_id)
+                    elif text.startswith("/routelist"):     _handle_routelist(chat_id)
                     else:
                         _send_to(ADMIN_CHAT_ID,
                             "Available commands:\n"
@@ -611,10 +510,7 @@ def poll_for_uploads():
                             "/listtruck\n/removetruck Unit4821\n"
                             "/findstop 0792  ← any group\n"
                             "/route 0792  ← any group\n"
-                            "/findload 8656  ← search QM trip\n"
-                            "/cheaters [days]  ← rank drivers by money lost\n"
-                            "/flags [truck]  ← driver flags\n"
-                            "/compliance [truck]  ← stop compliance"
+                            "/findload 8656  ← search QM trip"
                         )
                 except Exception as e:
                     log.error(f"Command error: {e}", exc_info=True)
@@ -632,25 +528,19 @@ def poll_for_uploads():
                 _send_to(ADMIN_CHAT_ID, f"❌ Unsupported file: `{filename}`")
                 continue
             _send_to(ADMIN_CHAT_ID, f"📥 Received `{filename}` — processing...")
-            try:
-                file_url = _get_file_url(file_id)
-                if not file_url:
-                    _send_to(ADMIN_CHAT_ID, "❌ Could not retrieve file URL from Telegram.")
-                    continue
-                file_bytes = _download_file(file_url)
-                if not file_bytes:
-                    _send_to(ADMIN_CHAT_ID, "❌ Failed to download file from Telegram.")
-                    continue
-                _send_to(ADMIN_CHAT_ID, f"⏳ Downloaded {len(file_bytes)//1024} KB — importing to DB...")
-                from price_updater import update_from_file
-                count, msg = update_from_file(file_bytes, filename)
-                _send_to(ADMIN_CHAT_ID, msg)
-                if count > 0:
-                    log.info(f"Admin uploaded {filename} — {count} stops updated.")
-            except Exception as up_err:
-                # Always tell admin SOMETHING went wrong — silence is the worst outcome
-                log.error(f"Upload processing failed for {filename}: {up_err}", exc_info=True)
-                _send_to(ADMIN_CHAT_ID, f"❌ Upload failed: `{str(up_err)[:200]}`")
+            file_url = _get_file_url(file_id)
+            if not file_url:
+                _send_to(ADMIN_CHAT_ID, "❌ Could not retrieve file.")
+                continue
+            file_bytes = _download_file(file_url)
+            if not file_bytes:
+                _send_to(ADMIN_CHAT_ID, "❌ Failed to download file.")
+                continue
+            from price_updater import update_from_file
+            count, msg = update_from_file(file_bytes, filename)
+            _send_to(ADMIN_CHAT_ID, msg)
+            if count > 0:
+                log.info(f"Admin uploaded {filename} — {count} stops updated.")
     except Exception as e:
         log.error(f"poll_for_uploads error: {e}", exc_info=True)
 
@@ -1532,82 +1422,6 @@ def _handle_flags(text: str, chat_id: str) -> None:
         _send_to(chat_id, "\n".join(lines))
 
 
-def _handle_cheaters(text: str, chat_id: str) -> None:
-    """/cheaters [days=30] — rank drivers by money lost from non-compliance.
-
-    Combines driver_flags.savings_lost (computed when driver goes to wrong stop)
-    with stop_visits where visited=FALSE (truck skipped recommended stop).
-    """
-    from database import db_cursor
-    from datetime import datetime, timezone, timedelta
-
-    parts = text.strip().split()
-    days  = 30
-    if len(parts) >= 2:
-        try: days = max(1, min(int(parts[1]), 365))
-        except ValueError: pass
-
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-
-    with db_cursor() as cur:
-        # Aggregate by truck: total flags + total dollars lost
-        cur.execute("""
-            SELECT
-                vehicle_name,
-                COUNT(*) FILTER (WHERE flag_type = 'WRONG_STOP')      AS wrong_stops,
-                COUNT(*) FILTER (WHERE flag_type = 'MISSED_STOP')     AS missed_stops,
-                COUNT(*) FILTER (WHERE flag_type = 'LOW_STOP_STATE')  AS low_stop,
-                COUNT(*)                                               AS total_flags,
-                COALESCE(SUM(savings_lost), 0)                         AS total_lost,
-                COUNT(*) FILTER (WHERE savings_lost IS NOT NULL AND savings_lost > 0) AS confirmed_loss_count
-            FROM driver_flags
-            WHERE flagged_at >= %s
-            GROUP BY vehicle_name
-            HAVING COUNT(*) > 0
-            ORDER BY COALESCE(SUM(savings_lost), 0) DESC, COUNT(*) DESC
-            LIMIT 15
-        """, (since,))
-        rows = cur.fetchall()
-
-    if not rows:
-        _send_to(chat_id, f"✅ No driver flags in the last {days} days. Either everyone's perfect or no flags fired yet.")
-        return
-
-    total_lost_all = sum(float(r["total_lost"] or 0) for r in rows)
-
-    lines = [
-        f"💸 *Driver Cheaters Report — Last {days} Days*",
-        f"📊 Top {len(rows)} drivers by losses",
-        f"💰 Total fleet loss: *${total_lost_all:.0f}*",
-        f"",
-    ]
-    medals = ["🥇","🥈","🥉"] + [f"{i}." for i in range(4, 16)]
-    for i, r in enumerate(rows):
-        loss     = float(r["total_lost"] or 0)
-        confirmed = int(r["confirmed_loss_count"] or 0)
-        flags    = int(r["total_flags"] or 0)
-        wrong    = int(r["wrong_stops"] or 0)
-        missed   = int(r["missed_stops"] or 0)
-        low      = int(r["low_stop"] or 0)
-        medal    = medals[i]
-        loss_str = f"${loss:.0f}" if loss > 0 else "no $ data"
-        # Note when losses are projected vs confirmed
-        unconfirmed = flags - confirmed
-        if unconfirmed > 0 and confirmed > 0:
-            note = f"  _({confirmed} confirmed, {unconfirmed} pending refuel)_"
-        elif unconfirmed > 0:
-            note = "  _(projected — pending refuel)_"
-        else:
-            note = "  _(confirmed)_"
-        lines.append(
-            f"{medal} *Truck {r['vehicle_name']}* — {loss_str}{note}\n"
-            f"     ⛽ {wrong} wrong  ·  🛣 {missed} missed  ·  ⚠️ {low} low-stop"
-        )
-
-    lines.append(f"\n_Tip: `/flags TRUCK#` for full list, `/compliance TRUCK#` for stops_")
-    _send_to(chat_id, "\n".join(lines))
-
-
 def send_weekly_truck_report() -> None:
     """Send per-truck Excel report every Monday alongside fleet summary."""
     import tempfile, os
@@ -1628,8 +1442,7 @@ def send_weekly_truck_report() -> None:
             "chat_id":  ADMIN_CHAT_ID,
             "caption":  f"📊 Per-Truck Weekly Report  |  {week}",
         }, files={"document": (f"DieselUp_Trucks_{week.replace(' ','_')}.xlsx", data,
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-        timeout=60)
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
         log.info("Per-truck Excel report sent to admin")
     except Exception as e:
         log.error(f"Truck report send failed: {e}", exc_info=True)
