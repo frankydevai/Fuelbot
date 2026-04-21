@@ -11,6 +11,7 @@ import time
 import signal
 import sys
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 from config import STATE_SAVE_INTERVAL_SECONDS
@@ -47,6 +48,38 @@ signal.signal(signal.SIGINT,  _shutdown)
 # -- Helpers ------------------------------------------------------------------
 def _utcnow():
     return datetime.now(timezone.utc)
+
+
+def _truck_route_keys(vehicle_name: str) -> list[str]:
+    """
+    Build possible QuickManage route keys for a Samsara vehicle name.
+
+    QM routes are usually keyed by plain truck number ("8238"), while Samsara
+    names can be "Truck 8238", "8238 - Volvo", etc.
+    """
+    text = str(vehicle_name or "").strip()
+    if not text:
+        return []
+
+    keys: list[str] = []
+
+    def _add(value: str):
+        value = str(value or "").strip()
+        if value and value not in keys:
+            keys.append(value)
+
+    _add(text)
+
+    digit_groups = re.findall(r"\d+", text)
+    for grp in digit_groups:
+        _add(grp)
+        _add(grp.lstrip("0") or "0")
+
+    # Also try the first standalone token in case vehicle_name is just the number
+    first = text.split()[0] if text.split() else ""
+    _add(first)
+
+    return keys
 
 
 # -- Price updater scheduler --------------------------------------------------
@@ -290,11 +323,27 @@ def main():
                     break
                 vid = truck["vehicle_id"]
                 # Attach QuickManage route to truck state if available
-                truck_num = truck.get("vehicle_name", "")
-                if truck_num in qm_routes:
-                    truck_states.setdefault(vid, {})["qm_route"] = qm_routes[truck_num]
+                vehicle_name = truck.get("vehicle_name", "")
+                route = None
+                matched_key = None
+                for key in _truck_route_keys(vehicle_name):
+                    if key in qm_routes:
+                        route = qm_routes[key]
+                        matched_key = key
+                        break
+
+                if route:
+                    prev_trip = (truck_states.get(vid, {}) or {}).get("qm_route", {}).get("trip_num")
+                    truck_states.setdefault(vid, {})["qm_route"] = route
+                    if prev_trip != route.get("trip_num"):
+                        log.info(
+                            f"Attached QM route to {vehicle_name}: key={matched_key} "
+                            f"trip={route.get('trip_num')} status={route.get('status')}"
+                        )
                 elif truck_states.get(vid, {}).get("qm_route"):
                     pass  # keep existing route
+                else:
+                    log.debug(f"No QM route match for {vehicle_name}; tried {_truck_route_keys(vehicle_name)}")
                 truck_start = time.time()
                 try:
                     process_truck(vid, truck_states.get(vid, {}),
