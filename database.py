@@ -157,6 +157,9 @@ CREATE TABLE IF NOT EXISTS fuel_alerts (
     best_stop_id        INTEGER,
     best_stop_name      TEXT,
     best_stop_price     REAL,
+    alt_stop_id         INTEGER,
+    alt_stop_name       TEXT,
+    alt_stop_price      REAL,
     best_stop_state     TEXT,
     gallons_purchased   REAL,
     savings_usd         REAL,
@@ -254,9 +257,12 @@ CREATE TABLE IF NOT EXISTS stop_visits (
     actual_stop_name       TEXT,
     actual_stop_lat        FLOAT,
     actual_stop_lng        FLOAT,
+    actual_stop_state      TEXT,
     visited         BOOLEAN,   -- TRUE=went to recommended, FALSE=went elsewhere, NULL=unknown
     fuel_before     FLOAT,
     fuel_after      FLOAT,
+    gallons_purchased REAL,
+    savings_usd     REAL,
     visited_at      TIMESTAMPTZ,
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
@@ -273,6 +279,9 @@ def init_db():
     cur.execute("ALTER TABLE trucks ALTER COLUMN telegram_group_id DROP NOT NULL")
     # Add missing fuel_alerts columns if not exists
     for col_def in [
+        "alt_stop_id INTEGER",
+        "alt_stop_name TEXT",
+        "alt_stop_price REAL",
         "best_stop_state TEXT",
         "gallons_purchased REAL",
     ]:
@@ -289,6 +298,26 @@ def init_db():
         ("prev_ca_dispatcher_msg_id", "BIGINT"),
     ]:
         cur.execute(f"ALTER TABLE truck_states ADD COLUMN IF NOT EXISTS {col} {coltype}")
+    for col, coltype in [
+        ("assigned_stop_card_price", "REAL"),
+        ("assigned_stop_net_price",  "REAL"),
+        ("missed_stop_name",         "TEXT"),
+        ("missed_stop_card_price",   "REAL"),
+        ("completed_waypoints",      "TEXT"),
+        ("border_warned",            "TEXT"),
+    ]:
+        cur.execute(f"ALTER TABLE trip_state ADD COLUMN IF NOT EXISTS {col} {coltype}")
+    for col, coltype in [
+        ("card_price",   "REAL"),
+        ("savings_lost", "REAL"),
+    ]:
+        cur.execute(f"ALTER TABLE driver_flags ADD COLUMN IF NOT EXISTS {col} {coltype}")
+    for col, coltype in [
+        ("actual_stop_state",  "TEXT"),
+        ("gallons_purchased",  "REAL"),
+        ("savings_usd",        "REAL"),
+    ]:
+        cur.execute(f"ALTER TABLE stop_visits ADD COLUMN IF NOT EXISTS {col} {coltype}")
     conn.commit()
     conn.close()
     log.info("✅ Database schema ready.")
@@ -680,12 +709,12 @@ def create_fuel_alert(vehicle_id, vehicle_name, fuel_pct, lat, lng,
         INSERT INTO fuel_alerts (
             vehicle_id, vehicle_name, fuel_pct, latitude, longitude,
             heading, speed_mph, alert_type,
-            best_stop_id, best_stop_name, best_stop_price,
+            best_stop_id, best_stop_name, best_stop_price, best_stop_state,
             alt_stop_id,  alt_stop_name,  alt_stop_price, savings_usd
         ) VALUES (
             %(vehicle_id)s, %(vehicle_name)s, %(fuel_pct)s, %(lat)s, %(lng)s,
             %(heading)s, %(speed_mph)s, %(alert_type)s,
-            %(best_stop_id)s, %(best_stop_name)s, %(best_stop_price)s,
+            %(best_stop_id)s, %(best_stop_name)s, %(best_stop_price)s, %(best_stop_state)s,
             %(alt_stop_id)s,  %(alt_stop_name)s,  %(alt_stop_price)s, %(savings_usd)s
         ) RETURNING id
     """
@@ -702,6 +731,7 @@ def create_fuel_alert(vehicle_id, vehicle_name, fuel_pct, lat, lng,
             "best_stop_id":    best_stop["id"]          if best_stop else None,
             "best_stop_name":  best_stop["store_name"]  if best_stop else None,
             "best_stop_price": best_stop["diesel_price"] if best_stop else None,
+            "best_stop_state": best_stop["state"]       if best_stop else None,
             "alt_stop_id":     alt_stop["id"]           if alt_stop else None,
             "alt_stop_name":   alt_stop["store_name"]   if alt_stop else None,
             "alt_stop_price":  alt_stop["diesel_price"]  if alt_stop else None,
@@ -788,22 +818,36 @@ def log_stop_visit(vehicle_name: str, alert_id: int,
                    actual_stop_name: str,
                    actual_lat: float, actual_lng: float,
                    visited: bool,
-                   fuel_before: float, fuel_after: float) -> None:
+                   fuel_before: float, fuel_after: float,
+                   actual_stop_state: str = None,
+                   gallons_purchased: float = None,
+                   savings_usd: float = None) -> None:
     """Log whether truck visited the recommended stop or went elsewhere."""
     from datetime import datetime, timezone
+    if gallons_purchased is None and fuel_before is not None and fuel_after is not None:
+        fuel_delta = max(float(fuel_after) - float(fuel_before), 0.0)
+        gallons_purchased = round(150.0 * fuel_delta / 100.0, 1) if fuel_delta > 0 else 0.0
+    if savings_usd is None and visited and alert_id:
+        try:
+            with db_cursor() as cur:
+                cur.execute("SELECT savings_usd FROM fuel_alerts WHERE id = %s", (alert_id,))
+                row = cur.fetchone()
+                savings_usd = float(row["savings_usd"]) if row and row.get("savings_usd") is not None else None
+        except Exception:
+            savings_usd = None
     with db_cursor() as cur:
         cur.execute("""
             INSERT INTO stop_visits (
                 vehicle_name, alert_id,
                 recommended_stop_name, recommended_stop_lat, recommended_stop_lng,
-                actual_stop_name, actual_stop_lat, actual_stop_lng,
-                visited, fuel_before, fuel_after, visited_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                actual_stop_name, actual_stop_lat, actual_stop_lng, actual_stop_state,
+                visited, fuel_before, fuel_after, gallons_purchased, savings_usd, visited_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             vehicle_name, alert_id,
             recommended_stop_name, recommended_lat, recommended_lng,
-            actual_stop_name, actual_lat, actual_lng,
-            visited, fuel_before, fuel_after,
+            actual_stop_name, actual_lat, actual_lng, actual_stop_state,
+            visited, fuel_before, fuel_after, gallons_purchased, savings_usd,
             datetime.now(timezone.utc)
         ))
 

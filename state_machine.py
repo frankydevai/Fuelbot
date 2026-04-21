@@ -266,16 +266,19 @@ def process_truck(vid, prev_state, current_data, truck_states):
             )
             msg = format_route_briefing(plan, vname, route, fuel, mpg)
 
-            # Skip silently if nothing to send (short route or geocoding error).
-            # Still mark briefing_sent_trip so we don't keep retrying every cycle.
+            # Skip short/local trips permanently, but do NOT suppress retries for
+            # bad geocoding or temporary route data issues.
             if not msg:
-                state["briefing_sent_trip"] = route_id
-                try:
-                    from database import save_trip_state
-                    save_trip_state(vname, state)
-                except Exception:
-                    pass
-                log.info(f"  {vname}: route briefing skipped (short route or bad route data)")
+                if plan.get("skipped_short_route"):
+                    state["briefing_sent_trip"] = route_id
+                    try:
+                        from database import save_trip_state
+                        save_trip_state(vname, state)
+                    except Exception:
+                        pass
+                    log.info(f"  {vname}: route briefing skipped (short/local trip)")
+                else:
+                    log.warning(f"  {vname}: route briefing produced no message; will retry next cycle")
                 # Fall through past this whole block by jumping to the end
                 state["last_trip_status"] = curr_status
                 # Don't return — let other state-machine logic still run
@@ -311,15 +314,6 @@ def process_truck(vid, prev_state, current_data, truck_states):
                         _send_to(truck_group, bw_msg)
                     _send_to_dispatcher(bw_msg)
 
-                # Mark as sent so we don't resend — persist immediately
-                state["briefing_sent_trip"] = route_id
-                try:
-                    from database import save_trip_state
-                    save_trip_state(vname, state)
-                    log.info(f"  {vname}: trip state persisted — trip {route_id}")
-                except Exception as dbe:
-                    log.warning(f"  {vname}: trip state save failed: {dbe}")
-
                 # Store planned stops so missed-stop detection works
                 if plan.get("planned_stops"):
                     next_stop = plan["planned_stops"][0]
@@ -330,6 +324,23 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     state["assigned_stop_card_price"] = next_stop.get("card_price") or next_stop.get("diesel_price")
                     state["all_planned_stops"]        = plan["planned_stops"]
                     state["planned_stop_index"]       = 0
+                else:
+                    state["all_planned_stops"]        = []
+                    state["planned_stop_index"]       = 0
+                    state["assigned_stop_name"]       = None
+                    state["assigned_stop_lat"]        = None
+                    state["assigned_stop_lng"]        = None
+                    state["assigned_stop_card_price"] = None
+
+                state["briefing_sent_trip"] = route_id
+                try:
+                    from database import save_trip_state
+                    save_trip_state(vname, state)
+                    log.info(f"  {vname}: trip state persisted — trip {route_id}")
+                except Exception as dbe:
+                    log.warning(f"  {vname}: trip state save failed: {dbe}")
+
+                if plan.get("planned_stops"):
                     log.info(f"  {vname}: route briefing sent — trip {route_id}, "
                              f"{plan['stops_needed']} stops planned, "
                              f"first stop: {next_stop['store_name']}")
@@ -431,6 +442,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                             actual_stop_name=stop_name,
                             actual_lat=float(current_stop_gf.get("latitude", lat)),
                             actual_lng=float(current_stop_gf.get("longitude", lng)),
+                            actual_stop_state=current_stop_gf.get("state"),
                             visited=visited,
                             fuel_before=fuel, fuel_after=fuel,
                         )
@@ -730,6 +742,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     recommended_lat=rec_lat, recommended_lng=rec_lng,
                     actual_stop_name=actual_name,
                     actual_lat=actual_lat, actual_lng=actual_lng,
+                    actual_stop_state=actual_stop.get("state") if actual_stop else None,
                     visited=is_planned,
                     fuel_before=prev_fuel, fuel_after=fuel,
                 )
@@ -796,17 +809,21 @@ def process_truck(vid, prev_state, current_data, truck_states):
         all_planned = state.get("all_planned_stops", [])
         cur_idx     = state.get("planned_stop_index", 0)
         next_idx    = cur_idx + 1
+        next_planned_stop = None
         if next_idx < len(all_planned):
             next_stop = all_planned[next_idx]
+            next_planned_stop = next_stop
             state["assigned_stop_name"] = next_stop["store_name"]
             state["assigned_stop_lat"]  = next_stop.get("latitude")
             state["assigned_stop_lng"]  = next_stop.get("longitude")
+            state["assigned_stop_card_price"] = next_stop.get("card_price") or next_stop.get("diesel_price")
             state["planned_stop_index"] = next_idx
             log.info(f"  {vname}: next planned stop → {next_stop['store_name']}")
         else:
             state["assigned_stop_name"] = None
             state["assigned_stop_lat"]  = None
             state["assigned_stop_lng"]  = None
+            state["assigned_stop_card_price"] = None
 
         if state.get("open_alert_id"):
             resolve_alert(state["open_alert_id"])
@@ -817,8 +834,18 @@ def process_truck(vid, prev_state, current_data, truck_states):
                             truck_lat=lat, truck_lng=lng,
                             actual_stop=_actual_stop)
         _clear_alert(state)
+        if next_planned_stop:
+            state["assigned_stop_name"] = next_planned_stop["store_name"]
+            state["assigned_stop_lat"]  = next_planned_stop.get("latitude")
+            state["assigned_stop_lng"]  = next_planned_stop.get("longitude")
+            state["assigned_stop_card_price"] = next_planned_stop.get("card_price") or next_planned_stop.get("diesel_price")
         state["state"]     = "HEALTHY" if fuel > FUEL_ALERT_THRESHOLD_PCT else "WATCH"
         state["next_poll"] = _next_poll(POLL_INTERVAL_HEALTHY)
+        try:
+            from database import save_trip_state
+            save_trip_state(vname, state)
+        except Exception as dbe:
+            log.warning(f"  {vname}: trip state save after refuel failed: {dbe}")
         return
 
     # ── 4b. WOKE UP (was parked, now moving) ──────────────────────────────────
