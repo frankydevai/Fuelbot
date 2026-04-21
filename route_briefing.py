@@ -244,7 +244,13 @@ def plan_route_briefing(
     cur_lng        = truck_lng
     cur_fuel_pct   = current_fuel_pct
     stop_number = 1
-    FILL_TO     = 90.0   # fill to 90% each stop
+    emergency_mode = current_fuel_pct <= 10
+    FILL_TO     = 100.0 if emergency_mode else 90.0
+
+    if emergency_mode:
+        warnings.append(
+            f"Emergency fuel level: {current_fuel_pct:.0f}% fuel. Nearest reachable stop takes priority."
+        )
 
     # ── Collect all stops along route ────────────────────────────────────────
     all_candidates = []
@@ -304,8 +310,12 @@ def plan_route_briefing(
             )
             break
 
-        # Pick a cheap stop late enough in the range window to avoid fueling too early.
-        s = _choose_best_route_stop(viable_candidates, sim_dist, range_now)
+        # At emergency fuel levels, prioritize the nearest reachable stop.
+        if emergency_mode and sim_dist == 0.0:
+            s = min(viable_candidates, key=lambda stop: stop["dist_from_truck"])
+        else:
+            # Pick a cheap stop late enough in the range window to avoid fueling too early.
+            s = _choose_best_route_stop(viable_candidates, sim_dist, range_now)
 
         dist_to_stop = s["dist_from_truck"]
         miles_to_stop = dist_to_stop - sim_dist
@@ -456,6 +466,7 @@ def plan_route_briefing(
         "warnings":                  warnings,       # only real warnings (low fuel etc)
         "border_warnings":           border_warnings, # sent separately
         "can_complete_without_stop": False,
+        "emergency_mode":            emergency_mode,
     }
 
 
@@ -484,6 +495,10 @@ def format_route_briefing(plan: dict, truck_name: str,
     if truck_lat is not None and truck_lng is not None:
         lines.append(f"Current location: {truck_lat:.4f}, {truck_lng:.4f}")
         lines.append(f"https://maps.google.com/?q={truck_lat},{truck_lng}")
+        lines.append("")
+
+    if plan.get("emergency_mode"):
+        lines.append("EMERGENCY: fuel is critically low. Route pricing is secondary to reaching fuel safely.")
         lines.append("")
 
     if plan["can_complete_without_stop"]:
